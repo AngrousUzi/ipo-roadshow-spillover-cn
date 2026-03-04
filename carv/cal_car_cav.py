@@ -29,22 +29,38 @@ import numpy as np
 import pandas as pd
 
 # ── 路径设置 ──────────────────────────────────────────────────────
-PROJECT_ROOT    = Path(__file__).resolve().parent.parent          # PythonProject
-HIGH_FREQ_ROOT  = Path(r"D:\科研\stock_data\CN\high_freq")
-RESAMPLE_DIR    = HIGH_FREQ_ROOT / "resample"
-CALCULATE_DIR   = HIGH_FREQ_ROOT / "calculate"
-AGGREGATED_PATH = HIGH_FREQ_ROOT / "aggregated"
-ANN_DIR         = PROJECT_ROOT / "anns"
-IND_DIR         = PROJECT_ROOT / "ind"
-OUTPUT_DIR      = Path(__file__).resolve().parent / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+if os.name=="nt":
+    PROJECT_ROOT    = Path(__file__).resolve().parent.parent          # PythonProject
+    HIGH_FREQ_ROOT  = Path(r"D:\科研\stock_data\CN\high_freq")
+    RESAMPLE_DIR    = HIGH_FREQ_ROOT / "resample"
+    CALCULATE_DIR   = HIGH_FREQ_ROOT / "calculate"
+    AGGREGATED_PATH = HIGH_FREQ_ROOT / "aggregated"
+    ANN_DIR         = PROJECT_ROOT / "anns"
+    IND_DIR         = PROJECT_ROOT / "ind"
+    OUTPUT_DIR      = Path(__file__).resolve().parent / "output"
+    OUTPUT_DIR.mkdir(exist_ok=True)
 
-INDEX_PATH = ANN_DIR / "IPO_index.xlsx"
-IND_PATH = IND_DIR / "ind_pairs.csv"
+    INDEX_PATH = ANN_DIR / "IPO_index.xlsx"
+    IND_PATH = IND_DIR / "ind_pairs.csv"
+else:
+    BASE_DIR        = Path("./").resolve()
+    PROJECT_ROOT    = Path("./ipo-roadshow-spillover-cn").resolve()           
+    HIGH_FREQ_ROOT  = Path("../data").resolve()            
+    RESAMPLE_DIR    = HIGH_FREQ_ROOT / "resample"
+    CALCULATE_DIR   = HIGH_FREQ_ROOT / "calculate"
+    AGGREGATED_PATH = HIGH_FREQ_ROOT / "aggregated"
+    # ANN_DIR         = PROJECT_ROOT / "anns"
+    # IND_DIR         = PROJECT_ROOT / "ind"
+    OUTPUT_DIR      = Path(__file__).resolve().parent / "output"
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    INDEX_PATH = BASE_DIR / "IPO_index.xlsx"
+    IND_PATH = BASE_DIR / "ind_pairs.csv"
+
 for p in [str(RESAMPLE_DIR), str(CALCULATE_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
-
+# print(sys.path)
 from cal_return import get_complete_return   # noqa: E402
 from indicator_cal import calculate_car, calculate_cav  # noqa: E402
 
@@ -70,25 +86,25 @@ def load_trading_dates() -> pd.DatetimeIndex:
     return pd.DatetimeIndex(pd.to_datetime(data["workdays"], format="%Y%m%d")).sort_values()
 
 
-def get_exchange(code: str) -> str:
+def get_exchange_symbol(code: str) -> str:
     """根据证券代码判断交易所"""
     code=str(code).zfill(6)  # 确保是6位字符串
     if code.startswith("0") or code.startswith("3"):
-        return "深交所A"
+        return "SZ"
     elif code.startswith("6"):
-        return "上交所A"
+        return "SH"
     elif code.startswith("83") or code.startswith("87") or code.startswith("88") or code.startswith("92"):
-        return "北交所A"
+        return "BJ"
     elif code.startswith("90"):
-        return "上交所B"
+        return "SH"
     elif code.startswith("20"):
-        return "北交所B"    
+        return "BJ"    
     else:
         return "未知交易所"
 
 def full_code(stkcd) -> str:
     code = str(int(stkcd)).zfill(6)
-    return get_exchange(code) + code
+    return get_exchange_symbol(code) + code
 
 
 def nth_trading_day(trading_dates: pd.DatetimeIndex, ref_date: pd.Timestamp, offset: int) -> pd.Timestamp:
