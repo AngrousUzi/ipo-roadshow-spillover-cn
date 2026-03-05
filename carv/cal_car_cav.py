@@ -142,8 +142,8 @@ def build_params(start: pd.Timestamp, end: pd.Timestamp) -> dict:
 def load_roadshow_index() -> pd.DataFrame:
     """加载路演索引，返回含 INDEX2009、Stkcd、roadshow_date 三列。"""
     df = pd.read_excel(INDEX_PATH, dtype=str)
-    df["roadshow_date"] = pd.to_datetime(df["公告路演日期"], errors="coerce")
-    df["roadshow_start"] = df["公告路演开始时间"].fillna("14:00")
+    df["roadshow_date"] = pd.to_datetime(df["日期"], errors="coerce")
+    df["roadshow_start"] = df["开始时间"]    # 只保留必要的列，过滤掉缺失路演日期的行
     df = df[["INDEX2009", "Stkcd", "roadshow_date", "roadshow_start"]].dropna(subset=["roadshow_date"])
     df.rename(columns={"INDEX2009": "ipo_id", "Stkcd": "ipo_stkcd_raw"}, inplace=True)
     return df
@@ -165,7 +165,7 @@ def compute_car_cav_for_rival(
     start_needed: pd.Timestamp,
     end_needed: pd.Timestamp,
     events: list[dict],
-) -> list[dict]:
+) -> list[pd.DataFrame]:
     """
     对单只竞争公司股票，批量计算所有关联事件的 CAR/CAV。
 
@@ -177,6 +177,12 @@ def compute_car_cav_for_rival(
     end_needed   : 本竞争公司所有事件中最晚的事件窗口结束日
     events       : list of dicts with keys:
                    ipo_id, event_date, est1_start, est1_end, est2_start, est2_end
+
+    Returns
+    -------
+    list[pd.DataFrame]: 每个事件对应一个 DataFrame，列为
+        [timestamp, car_est1, car_est2, cav_est1, cav_est2, ipo_id, rival_fc, event_date]
+        行 = 事件窗口内的每个 5min 时间戳（累积值序列）
     """
     # ── 加载竞争公司 5分钟收益率 ──
     params = build_params(start_needed, end_needed)
@@ -193,19 +199,11 @@ def compute_car_cav_for_rival(
 
     results = []
     for ev in events:
-        rec = {
-            "ipo_id":    ev["ipo_id"],
-            "rival_fc":  rival_fc,
-            "event_date": str(ev["event_date"].date()),
-        }
-
-        # 事件窗口（路演当日完整交易时段）
         ev_date_str = str(ev["event_date"].date())
 
         try:
-            # ── CAR ──
-            # 直接传全量 mkt_series，由 calculate_car 内部用 estimation_start/end 裁剪
-            rec["car_est1"] = calculate_car(
+            # ── CAR （返回事件窗口内的 cumsum Series）──
+            car_est1 = calculate_car(
                 stock_data=rival_data,
                 market_data=mkt_series,
                 event_start=ev_date_str,
@@ -213,7 +211,7 @@ def compute_car_cav_for_rival(
                 estimation_start=str(ev["est1_start"].date()),
                 estimation_end=str(ev["est1_end"].date()),
             )
-            rec["car_est2"] = calculate_car(
+            car_est2 = calculate_car(
                 stock_data=rival_data,
                 market_data=mkt_series,
                 event_start=ev_date_str,
@@ -222,8 +220,8 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est2_end"].date()),
             )
 
-            # ── CAV ──
-            rec["cav_est1"] = calculate_cav(
+            # ── CAV （返回事件窗口内的 cumsum Series）──
+            cav_est1 = calculate_cav(
                 stock_data=rival_data,
                 event_start=ev_date_str,
                 event_end=ev_date_str,
@@ -231,7 +229,7 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est1_end"].date()),
                 volume_col="Volume",
             )
-            rec["cav_est2"] = calculate_cav(
+            cav_est2 = calculate_cav(
                 stock_data=rival_data,
                 event_start=ev_date_str,
                 event_end=ev_date_str,
@@ -239,12 +237,36 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est2_end"].date()),
                 volume_col="Volume",
             )
+
+            # 将四个序列拼成一张宽表，行 = 事件窗口内的 5min 时间戳
+            def _to_series(x, name):
+                """scalar NaN 或 Series 都可处理"""
+                if isinstance(x, pd.Series):
+                    return x.rename(name)
+                return pd.Series([np.nan], name=name)
+
+            df_ev = pd.concat(
+                [_to_series(car_est1, "car_est1"),
+                 _to_series(car_est2, "car_est2"),
+                 _to_series(cav_est1, "cav_est1"),
+                 _to_series(cav_est2, "cav_est2")],
+                axis=1,
+            )
+
         except Exception as e:
             log_error(f"rival {rival_fc} | ipo_id {ev['ipo_id']} | event {ev_date_str} | {e}")
-            rec.update({"car_est1": np.nan, "car_est2": np.nan,
-                        "cav_est1": np.nan, "cav_est2": np.nan})
+            df_ev = pd.DataFrame(
+                [{"car_est1": np.nan, "car_est2": np.nan,
+                  "cav_est1": np.nan, "cav_est2": np.nan}]
+            )
 
-        results.append(rec)
+        df_ev.index.name = "timestamp"
+        df_ev = df_ev.reset_index()
+        df_ev["ipo_id"]     = ev["ipo_id"]
+        df_ev["rival_fc"]   = rival_fc
+        df_ev["event_date"] = ev_date_str
+        results.append(df_ev)
+
     return results
 
 
@@ -312,9 +334,11 @@ def main():
     # ── 按竞争公司分组，逐股计算 ──────────────────────────────────
     # 断点续算：读取已有结果
     if OUTPUT_FILE.exists():
-        existing = pd.read_csv(OUTPUT_FILE, usecols=["ipo_id", "rival_fc"])
-        done_keys = set(zip(existing["ipo_id"], existing["rival_fc"]))
-        print(f"已有 {len(done_keys):,} 条结果，将跳过已完成的配对")
+        # existing = pd.read_csv(OUTPUT_FILE, usecols=["ipo_id", "rival_fc"])
+        # done_keys = set(zip(existing["ipo_id"], existing["rival_fc"]))
+        # print(f"已有 {len(done_keys):,} 条结果，将跳过已完成的配对")
+        OUTPUT_FILE.unlink()  # TEMP:删除已有文件，重新计算全部配对
+        done_keys = set()
     else:
         done_keys = set()
 
@@ -335,6 +359,7 @@ def main():
 
     for i, (rival_fc, grp) in enumerate(grouped):
         # 本竞争公司所需的最宽日期范围
+        print(f"\n[{i+1}/{total_rivals}] 处理竞争公司 {rival_fc} ...")
         r_start = grp["est1_start"].min()
         r_end   = grp["event_end"].max()
 
@@ -358,7 +383,11 @@ def main():
         # 每 100 只股票写出一次
         if (i + 1) % 100 == 0 or (i + 1) == total_rivals:
             if all_results:
-                df_out = pd.DataFrame(all_results)
+                df_out = pd.concat(all_results, ignore_index=True)
+                # 调整列顺序：标识德列在前
+                cols_order = ["ipo_id", "rival_fc", "event_date", "timestamp",
+                              "car_est1", "car_est2", "cav_est1", "cav_est2"]
+                df_out = df_out[[c for c in cols_order if c in df_out.columns]]
                 df_out.to_csv(
                     OUTPUT_FILE,
                     mode="a",
