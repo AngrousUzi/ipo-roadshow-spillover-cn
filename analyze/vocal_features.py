@@ -32,7 +32,7 @@ except ImportError:
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
 
-def _load_audio(wav_path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
+def load_audio(wav_path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int]:
     """加载 wav 文件，返回 (waveform, sample_rate)。"""
     if not _LIBROSA_OK:
         raise ImportError("librosa 未安装")
@@ -40,7 +40,7 @@ def _load_audio(wav_path: Path, target_sr: int = 16000) -> tuple[np.ndarray, int
     return y, sr
 
 
-def _extract_f0(y: np.ndarray, sr: int,
+def extract_f0(y: np.ndarray, sr: int,
                 fmin: float = 50.0, fmax: float = 600.0,
                 hop_length: int = 512) -> tuple[float, float]:
     """
@@ -55,7 +55,7 @@ def _extract_f0(y: np.ndarray, sr: int,
     return float(np.mean(voiced)), float(np.std(voiced))
 
 
-def _extract_rms(y: np.ndarray, sr: int,
+def extract_rms(y: np.ndarray, sr: int,
                  hop_length: int = 512) -> tuple[float, float]:
     """
     提取帧级 RMS 能量，返回 (均值, 标准差)。
@@ -64,7 +64,7 @@ def _extract_rms(y: np.ndarray, sr: int,
     return float(np.mean(rms)), float(np.std(rms))
 
 
-def _calc_speech_rate(transcript_json_path: Path) -> float:
+def calc_speech_rate(transcript_json_path: Path) -> float:
     """
     从 WhisperX 转录 JSON 计算语速（字符/秒）。
 
@@ -144,25 +144,32 @@ def extract_vocal_features(
     }
 
     try:
-        y, sr = _load_audio(wav_path, target_sr=target_sr)
+        y, sr = load_audio(wav_path, target_sr=target_sr)
         result["duration_s"] = float(len(y)) / sr
 
         # 基频
-        f0_mean, f0_std = _extract_f0(y, sr, fmin=fmin, fmax=fmax,
+        f0_mean, f0_std = extract_f0(y, sr, fmin=fmin, fmax=fmax,
                                       hop_length=hop_length)
         result["f0_mean"] = f0_mean
         result["f0_std"]  = f0_std
 
         # 音量
-        rms_mean, rms_std = _extract_rms(y, sr, hop_length=hop_length)
+        rms_mean, rms_std = extract_rms(y, sr, hop_length=hop_length)
         result["rms_mean"] = rms_mean
         result["rms_std"]  = rms_std
 
         # 语速
         if transcript_json_path is not None:
-            result["speech_rate"] = _calc_speech_rate(transcript_json_path)
+            result["speech_rate"] = calc_speech_rate(transcript_json_path)
 
     except Exception as e:
         result["error"] = str(e)
 
     return result
+
+if __name__ == "__main__":
+    # 示例：处理单个文件
+    wav_path = Path("example.wav")
+    transcript_json_path = Path("example.json")
+    features = extract_vocal_features(wav_path, transcript_json_path)
+    print(features)

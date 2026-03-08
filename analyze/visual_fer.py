@@ -230,3 +230,10 @@ def extract_visual_emotions(
         cap.release()
 
     return result
+
+if __name__ == "__main__":
+    import argparse
+    video_path = Path("sample_pitch.mp4")  # 替换为实际视频路径
+
+    res = extract_visual_emotions(video_path)
+    print(res)

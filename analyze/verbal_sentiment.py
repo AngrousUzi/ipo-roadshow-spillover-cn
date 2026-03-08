@@ -46,7 +46,7 @@ except ImportError:
 
 # ─── 词典加载 ─────────────────────────────────────────────────────────
 
-def _load_lexicon(txt_path: Path) -> set:
+def load_lexicon(txt_path: Path) -> set:
     """加载词典文件，返回词集合。"""
     if not txt_path.exists():
         return set()
@@ -65,9 +65,9 @@ def load_lexicons(lexicon_dir: Path) -> dict[str, set]:
         {"positive": set, "negative": set, "uncertainty": set}
     """
     return {
-        "positive":   _load_lexicon(lexicon_dir / "positive.txt"),
-        "negative":   _load_lexicon(lexicon_dir / "negative.txt"),
-        "uncertainty": _load_lexicon(lexicon_dir / "uncertainty.txt"),
+        "positive":   load_lexicon(lexicon_dir / "positive.txt"),
+        "negative":   load_lexicon(lexicon_dir / "negative.txt"),
+        "uncertainty": load_lexicon(lexicon_dir / "uncertainty.txt"),
     }
 
 
@@ -90,7 +90,7 @@ def _tokenize(text: str) -> list[str]:
 
 # ─── 主要分析方法 ──────────────────────────────────────────────────────
 
-def _analyze_with_lexicon(text: str, lexicons: dict[str, set]) -> dict:
+def analyze_with_lexicon(text: str, lexicons: dict[str, set]) -> dict:
     """使用词典方法计算情绪指标。"""
     tokens = _tokenize(text)
     total = len(tokens)
@@ -118,7 +118,7 @@ def _analyze_with_lexicon(text: str, lexicons: dict[str, set]) -> dict:
     }
 
 
-def _analyze_with_snownlp(segments: list[dict]) -> dict:
+def analyze_with_snownlp(segments: list[dict]) -> dict:
     """使用 SnowNLP 计算段落极性均值，映射为 tone_score ∈ [-1, 1]。"""
     if not _SNOW_OK:
         raise ImportError("snownlp 未安装，且词典文件不存在，无法计算情绪。pip install snownlp")
@@ -214,10 +214,10 @@ def analyze_verbal_sentiment(
         has_lexicon = any(len(v) > 0 for v in lexicons.values())
 
         if has_lexicon:
-            scores = _analyze_with_lexicon(full_text, lexicons)
+            scores = analyze_with_lexicon(full_text, lexicons)
         else:
             # 无词典文件时使用 SnowNLP
-            scores = _analyze_with_snownlp(segments)
+            scores = analyze_with_snownlp(segments)
 
         result.update(scores)
 
@@ -225,3 +225,8 @@ def analyze_verbal_sentiment(
         result["error"] = str(e)
 
     return result
+
+if __name__ == "__main__":
+    json_path = Path("sample_transcript.json")  # 替换为实际 JSON 路径
+    res = analyze_verbal_sentiment(json_path)
+    print(res)
