@@ -26,6 +26,9 @@ import warnings
 import datetime as dt
 from pathlib import Path
 
+import multiprocessing as mp
+import pickle as _pickle
+
 import numpy as np
 import pandas as pd
 
@@ -77,7 +80,7 @@ EST2_END_OFFSET   = -5     # 包含
 EST3_START_OFFSET = -5     # 包含
 EST3_END_OFFSET   = -2     # 包含
 EVENT_START_OFFSET = -1
-EVENT_END_OFFSET   = 1     # 只看路演当日
+EVENT_END_OFFSET   = 1     
 OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
 ERROR_LOG         = OUTPUT_DIR / "errors.txt"
 
@@ -205,31 +208,32 @@ def compute_car_cav_for_rival(
 
     results = []
     for ev in events:
-        ev_date_str = str(ev["event_date"].date())
-
+        ev_date_str  = str(ev["event_date"].date())
+        ev_start_str = str(ev["event_start"].date())
+        ev_end_str   = str(ev["event_end"].date())
         try:
             # ── CAR （返回事件窗口内的 cumsum Series）──
             car_est1 = calculate_car(
                 stock_data=rival_data,
                 market_data=mkt_series,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est1_start"].date()),
                 estimation_end=str(ev["est1_end"].date()),
             )
             car_est2 = calculate_car(
                 stock_data=rival_data,
                 market_data=mkt_series,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est2_start"].date()),
                 estimation_end=str(ev["est2_end"].date()),
             )
             car_est3 = calculate_car(
                 stock_data=rival_data,
                 market_data=mkt_series,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est3_start"].date()),
                 estimation_end=str(ev["est3_end"].date()),
             )
@@ -237,24 +241,24 @@ def compute_car_cav_for_rival(
             # ── CAV （返回事件窗口内的 cumsum Series）──
             cav_est1 = calculate_cav(
                 stock_data=rival_data,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est1_start"].date()),
                 estimation_end=str(ev["est1_end"].date()),
                 volume_col="Volume",
             )
             cav_est2 = calculate_cav(
                 stock_data=rival_data,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est2_start"].date()),
                 estimation_end=str(ev["est2_end"].date()),
                 volume_col="Volume",
             )
             cav_est3 = calculate_cav(
                 stock_data=rival_data,
-                event_start=ev_date_str,
-                event_end=ev_date_str,
+                event_start=ev_start_str,
+                event_end=ev_end_str,
                 estimation_start=str(ev["est3_start"].date()),
                 estimation_end=str(ev["est3_end"].date()),
                 volume_col="Volume",
@@ -292,6 +296,33 @@ def compute_car_cav_for_rival(
         results.append(df_ev)
 
     return results
+
+
+# ── 多进程支持 ────────────────────────────────────────────────────
+_worker_market_data: "pd.DataFrame | None" = None
+
+
+def _pool_init(market_pkl: bytes) -> None:
+    """Worker 初始化：将序列化的市场指数数据恢复为全局变量。"""
+    global _worker_market_data
+    _worker_market_data = _pickle.loads(market_pkl)
+
+
+def _rival_task(args: tuple) -> tuple:
+    """
+    单只竞争公司的多进程计算任务。
+    args: (rival_fc, r_start, r_end, events)
+    返回: (rival_fc, list[pd.DataFrame])
+    """
+    rival_fc, r_start, r_end, events = args
+    records = compute_car_cav_for_rival(
+        rival_fc=rival_fc,
+        market_return=_worker_market_data.copy(),
+        start_needed=r_start,
+        end_needed=r_end,
+        events=events,
+    )
+    return rival_fc, records
 
 
 # ── 主流程 ────────────────────────────────────────────────────────
@@ -333,14 +364,17 @@ def main():
         lambda d: safe_offset(d, EST2_END_OFFSET))
     unique_events["est3_start"] = unique_events["roadshow_date"].apply(
         lambda d: safe_offset(d, EST3_START_OFFSET))
-    unique_events["est3_end"]   = unique_events["roadshow_date"].apply(
+    unique_events["est3_end"]    = unique_events["roadshow_date"].apply(
         lambda d: safe_offset(d, EST3_END_OFFSET))
-    unique_events["event_end"]  = unique_events["roadshow_date"].apply(
+    unique_events["event_start"] = unique_events["roadshow_date"].apply(
+        lambda d: safe_offset(d, EVENT_START_OFFSET))
+    unique_events["event_end"]   = unique_events["roadshow_date"].apply(
         lambda d: safe_offset(d, EVENT_END_OFFSET))
 
     # 过滤掉偏移计算失败的行
     unique_events = unique_events.dropna(
-        subset=["est1_start", "est1_end", "est2_start", "est2_end", "est3_start", "est3_end"])
+        subset=["est1_start", "est1_end", "est2_start", "est2_end",
+                "est3_start", "est3_end", "event_start", "event_end"])
 
     # 合并回 pairs
     pairs = pairs.merge(unique_events.drop(columns=["roadshow_date"]), on="ipo_id", how="inner")
@@ -382,53 +416,56 @@ def main():
     total_rivals = len(grouped)
     print(f"待加载竞争公司数：{total_rivals:,}")
 
-    all_results = []
-    write_header = not OUTPUT_FILE.exists()
-
-    for i, (rival_fc, grp) in enumerate(grouped):
-        # 本竞争公司所需的最宽日期范围
-        print(f"\n[{i+1}/{total_rivals}] 处理竞争公司 {rival_fc} ...")
+    # ── 构建任务列表 ──────────────────────────────────────────────
+    tasks = []
+    for rival_fc, grp in grouped:
         r_start = grp["est1_start"].min()
         r_end   = grp["event_end"].max()
-
-        # 构建 events list
         events = grp[[
             "ipo_id", "roadshow_date",
             "est1_start", "est1_end",
             "est2_start", "est2_end",
             "est3_start", "est3_end",
-            "event_end",
+            "event_start", "event_end",
         ]].rename(columns={"roadshow_date": "event_date"}).to_dict("records")
+        tasks.append((rival_fc, r_start, r_end, events))
 
-        records = compute_car_cav_for_rival(
-            rival_fc=rival_fc,
-            market_return=market_data.copy(),
-            start_needed=r_start,
-            end_needed=r_end,
-            events=events,
-        )
-        all_results.extend(records)
+    # ── 多进程并行计算 ────────────────────────────────────────────
+    market_pkl = _pickle.dumps(market_data)
+    n_workers = max(1, mp.cpu_count() - 1)
+    print(f"使用 {n_workers} 个进程并行计算...")
 
-        # 每 100 只股票写出一次
-        if (i + 1) % 100 == 0 or (i + 1) == total_rivals:
-            if all_results:
-                df_out = pd.concat(all_results, ignore_index=True)
-                # 调整列顺序：标识德列在前
-                cols_order = ["ipo_id", "rival_fc", "event_date", "timestamp",
-                              "car_est1", "car_est2", "car_est3",
-                              "cav_est1", "cav_est2", "cav_est3"]
-                df_out = df_out[[c for c in cols_order if c in df_out.columns]]
-                df_out.to_csv(
-                    OUTPUT_FILE,
-                    mode="a",
-                    header=write_header,
-                    index=False,
-                    encoding="utf-8-sig",
-                )
-                write_header = False
-                all_results = []
-            pct = (i + 1) / total_rivals * 100
-            print(f"  [{i+1:>5}/{total_rivals}] ({pct:.1f}%)  最近: {rival_fc}")
+    all_results = []
+    write_header = not OUTPUT_FILE.exists()
+
+    with mp.Pool(
+        processes=n_workers,
+        initializer=_pool_init,
+        initargs=(market_pkl,),
+    ) as pool:
+        for i, (rival_fc, records) in enumerate(
+            pool.imap_unordered(_rival_task, tasks)
+        ):
+            all_results.extend(records)
+
+            if (i + 1) % 100 == 0 or (i + 1) == total_rivals:
+                if all_results:
+                    df_out = pd.concat(all_results, ignore_index=True)
+                    cols_order = ["ipo_id", "rival_fc", "event_date", "timestamp",
+                                  "car_est1", "car_est2", "car_est3",
+                                  "cav_est1", "cav_est2", "cav_est3"]
+                    df_out = df_out[[c for c in cols_order if c in df_out.columns]]
+                    df_out.to_csv(
+                        OUTPUT_FILE,
+                        mode="a",
+                        header=write_header,
+                        index=False,
+                        encoding="utf-8-sig",
+                    )
+                    write_header = False
+                    all_results = []
+                pct = (i + 1) / total_rivals * 100
+                print(f"  [{i+1:>5}/{total_rivals}] ({pct:.1f}%)  最近: {rival_fc}")
 
     print(f"\n完成！结果保存于：{OUTPUT_FILE}")
 
