@@ -9,6 +9,7 @@
 估计窗口（filepath.md）：
   EST1  : [-120, -30] 交易日
   EST2  : [-30,  -5]  交易日
+    EST3  : [ -5,  -2]  交易日
   
 事件窗口：
   路演当日完整交易时段 [09:25, 15:00]
@@ -73,8 +74,10 @@ EST1_START_OFFSET = -120   # 包含
 EST1_END_OFFSET   = -30    # 包含
 EST2_START_OFFSET = -30    # 包含
 EST2_END_OFFSET   = -5     # 包含
-EVENT_START_OFFSET = 0
-EVENT_END_OFFSET   = 0     # 只看路演当日
+EST3_START_OFFSET = -5     # 包含
+EST3_END_OFFSET   = -2     # 包含
+EVENT_START_OFFSET = -1
+EVENT_END_OFFSET   = 1     # 只看路演当日
 OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
 ERROR_LOG         = OUTPUT_DIR / "errors.txt"
 
@@ -176,7 +179,10 @@ def compute_car_cav_for_rival(
     start_needed : 本竞争公司所有事件中最早的估计窗口开始日
     end_needed   : 本竞争公司所有事件中最晚的事件窗口结束日
     events       : list of dicts with keys:
-                   ipo_id, event_date, est1_start, est1_end, est2_start, est2_end
+                   ipo_id, event_date,
+                   est1_start, est1_end,
+                   est2_start, est2_end,
+                   est3_start, est3_end
 
     Returns
     -------
@@ -219,6 +225,14 @@ def compute_car_cav_for_rival(
                 estimation_start=str(ev["est2_start"].date()),
                 estimation_end=str(ev["est2_end"].date()),
             )
+            car_est3 = calculate_car(
+                stock_data=rival_data,
+                market_data=mkt_series,
+                event_start=ev_date_str,
+                event_end=ev_date_str,
+                estimation_start=str(ev["est3_start"].date()),
+                estimation_end=str(ev["est3_end"].date()),
+            )
 
             # ── CAV （返回事件窗口内的 cumsum Series）──
             cav_est1 = calculate_cav(
@@ -237,6 +251,14 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est2_end"].date()),
                 volume_col="Volume",
             )
+            cav_est3 = calculate_cav(
+                stock_data=rival_data,
+                event_start=ev_date_str,
+                event_end=ev_date_str,
+                estimation_start=str(ev["est3_start"].date()),
+                estimation_end=str(ev["est3_end"].date()),
+                volume_col="Volume",
+            )
 
             # 将四个序列拼成一张宽表，行 = 事件窗口内的 5min 时间戳
             def _to_series(x, name):
@@ -248,16 +270,18 @@ def compute_car_cav_for_rival(
             df_ev = pd.concat(
                 [_to_series(car_est1, "car_est1"),
                  _to_series(car_est2, "car_est2"),
+                 _to_series(car_est3, "car_est3"),
                  _to_series(cav_est1, "cav_est1"),
-                 _to_series(cav_est2, "cav_est2")],
+                 _to_series(cav_est2, "cav_est2"),
+                 _to_series(cav_est3, "cav_est3")],
                 axis=1,
             )
 
         except Exception as e:
             log_error(f"rival {rival_fc} | ipo_id {ev['ipo_id']} | event {ev_date_str} | {e}")
             df_ev = pd.DataFrame(
-                [{"car_est1": np.nan, "car_est2": np.nan,
-                  "cav_est1": np.nan, "cav_est2": np.nan}]
+                                [{"car_est1": np.nan, "car_est2": np.nan, "car_est3": np.nan,
+                                    "cav_est1": np.nan, "cav_est2": np.nan, "cav_est3": np.nan}]
             )
 
         df_ev.index.name = "timestamp"
@@ -307,12 +331,16 @@ def main():
         lambda d: safe_offset(d, EST2_START_OFFSET))
     unique_events["est2_end"]   = unique_events["roadshow_date"].apply(
         lambda d: safe_offset(d, EST2_END_OFFSET))
+    unique_events["est3_start"] = unique_events["roadshow_date"].apply(
+        lambda d: safe_offset(d, EST3_START_OFFSET))
+    unique_events["est3_end"]   = unique_events["roadshow_date"].apply(
+        lambda d: safe_offset(d, EST3_END_OFFSET))
     unique_events["event_end"]  = unique_events["roadshow_date"].apply(
         lambda d: safe_offset(d, EVENT_END_OFFSET))
 
     # 过滤掉偏移计算失败的行
     unique_events = unique_events.dropna(
-        subset=["est1_start", "est1_end", "est2_start", "est2_end"])
+        subset=["est1_start", "est1_end", "est2_start", "est2_end", "est3_start", "est3_end"])
 
     # 合并回 pairs
     pairs = pairs.merge(unique_events.drop(columns=["roadshow_date"]), on="ipo_id", how="inner")
@@ -368,6 +396,7 @@ def main():
             "ipo_id", "roadshow_date",
             "est1_start", "est1_end",
             "est2_start", "est2_end",
+            "est3_start", "est3_end",
             "event_end",
         ]].rename(columns={"roadshow_date": "event_date"}).to_dict("records")
 
@@ -386,7 +415,8 @@ def main():
                 df_out = pd.concat(all_results, ignore_index=True)
                 # 调整列顺序：标识德列在前
                 cols_order = ["ipo_id", "rival_fc", "event_date", "timestamp",
-                              "car_est1", "car_est2", "cav_est1", "cav_est2"]
+                              "car_est1", "car_est2", "car_est3",
+                              "cav_est1", "cav_est2", "cav_est3"]
                 df_out = df_out[[c for c in cols_order if c in df_out.columns]]
                 df_out.to_csv(
                     OUTPUT_FILE,
