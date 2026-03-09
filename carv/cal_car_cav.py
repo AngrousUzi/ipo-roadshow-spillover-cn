@@ -83,10 +83,10 @@ EST2_END_OFFSET   = -5     # 包含
 EST3_START_OFFSET = -5     # 包含
 EST3_END_OFFSET   = -2     # 包含
 EVENT_START_OFFSET = -1
-EVENT_END_OFFSET   = 1
-OUTPUT_FILE        = OUTPUT_DIR / "car_cav_results.csv"
-ERROR_LOG          = OUTPUT_DIR / "errors.txt"
-CPU_NUM            = int(os.getenv("SLURM_CPUS_PER_TASK", 4))
+EVENT_END_OFFSET   = 1     
+OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
+ERROR_LOG         = OUTPUT_DIR / "errors.txt"
+CPU_NUM =int(os.getenv("SLURM_CPUS_PER_TASK", 10)) 
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 
@@ -314,7 +314,9 @@ def _rival_task(args: tuple) -> tuple:
     args: (rival_fc, r_start, r_end, events)
     返回: (rival_fc, list[pd.DataFrame])
     """
+
     rival_fc, r_start, r_end, events = args
+    # print(f"Processing rival {rival_fc} with {len(events)} event(s) | Estimation window: {r_start.date()} ~ {r_end.date()} ...", flush=True)
     records = compute_car_cav_for_rival(
         rival_fc=rival_fc,
         market_return=_worker_market_data.copy(),
@@ -322,6 +324,7 @@ def _rival_task(args: tuple) -> tuple:
         end_needed=r_end,
         events=events,
     )
+    # print(f"Completed rival {rival_fc} with {len(records)} event(s)", flush=True)
     return rival_fc, records
 
 
@@ -424,6 +427,7 @@ def main():
         tasks.append((rival_fc, r_start, r_end, events))
 
     # ── 多进程并行计算 ────────────────────────────────────────────
+    # 将市场数据写入临时 parquet，worker 各自从文件加载，避免每个 worker pickle 3.3g 数据
     _market_tmp = OUTPUT_DIR / "_market_tmp.parquet"
     market_data.to_parquet(_market_tmp)
     market_parquet_path = str(_market_tmp)
@@ -471,5 +475,6 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")
     main()
 
