@@ -27,7 +27,6 @@ import datetime as dt
 from pathlib import Path
 
 import multiprocessing as mp
-import pickle as _pickle
 
 import numpy as np
 import pandas as pd
@@ -83,6 +82,7 @@ EVENT_START_OFFSET = -1
 EVENT_END_OFFSET   = 1     
 OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
 ERROR_LOG         = OUTPUT_DIR / "errors.txt"
+CPU_NUM =int(os.getenv("SLURM_CPUS_PER_TASK", 10)) 
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 
@@ -302,11 +302,12 @@ def compute_car_cav_for_rival(
 _worker_market_data: "pd.DataFrame | None" = None
 
 
-def _pool_init(market_pkl: bytes) -> None:
-    """Worker 初始化：将序列化的市场指数数据恢复为全局变量。"""
+def _pool_init(market_parquet_path: str) -> None:
+    """Worker 初始化：从 parquet 文件加载市场指数数据（避免每个 worker pickle 3.3g 数据）。"""
     global _worker_market_data
-    _worker_market_data = _pickle.loads(market_pkl)
-
+    # print("Worker initializing, loading market data from parquet...", flush=True)
+    _worker_market_data = pd.read_parquet(market_parquet_path)
+    # print("Worker initialized, market data loaded from parquet.", flush=True)
 
 def _rival_task(args: tuple) -> tuple:
     """
@@ -314,7 +315,9 @@ def _rival_task(args: tuple) -> tuple:
     args: (rival_fc, r_start, r_end, events)
     返回: (rival_fc, list[pd.DataFrame])
     """
+
     rival_fc, r_start, r_end, events = args
+    # print(f"Processing rival {rival_fc} with {len(events)} event(s) | Estimation window: {r_start.date()} ~ {r_end.date()} ...", flush=True)
     records = compute_car_cav_for_rival(
         rival_fc=rival_fc,
         market_return=_worker_market_data.copy(),
@@ -322,6 +325,7 @@ def _rival_task(args: tuple) -> tuple:
         end_needed=r_end,
         events=events,
     )
+    # print(f"Completed rival {rival_fc} with {len(records)} event(s)", flush=True)
     return rival_fc, records
 
 
@@ -431,8 +435,12 @@ def main():
         tasks.append((rival_fc, r_start, r_end, events))
 
     # ── 多进程并行计算 ────────────────────────────────────────────
-    market_pkl = _pickle.dumps(market_data)
-    n_workers = max(1, mp.cpu_count() - 1)
+    # 将市场数据写入临时 parquet，worker 各自从文件加载，避免每个 worker pickle 3.3g 数据
+    _market_tmp = OUTPUT_DIR / "_market_tmp.parquet"
+    market_data.to_parquet(_market_tmp)
+    market_parquet_path = str(_market_tmp)
+
+    n_workers = max(1, CPU_NUM - 1)
     print(f"使用 {n_workers} 个进程并行计算...")
 
     all_results = []
@@ -441,7 +449,7 @@ def main():
     with mp.Pool(
         processes=n_workers,
         initializer=_pool_init,
-        initargs=(market_pkl,),
+        initargs=(market_parquet_path,),
     ) as pool:
         for i, (rival_fc, records) in enumerate(
             pool.imap_unordered(_rival_task, tasks)
@@ -467,8 +475,13 @@ def main():
                 pct = (i + 1) / total_rivals * 100
                 print(f"  [{i+1:>5}/{total_rivals}] ({pct:.1f}%)  最近: {rival_fc}")
 
+    # 清理临时文件
+    if _market_tmp.exists():
+        _market_tmp.unlink()
+
     print(f"\n完成！结果保存于：{OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")
     main()
