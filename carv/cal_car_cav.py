@@ -9,14 +9,18 @@
 估计窗口（filepath.md）：
   EST1  : [-120, -30] 交易日
   EST2  : [-30,  -5]  交易日
-    EST3  : [ -5,  -2]  交易日
+  EST3  : [ -5,  -2]  交易日
   
-事件窗口：
-  路演当日完整交易时段 [09:25, 15:00]
-  （路演开始时间通常 14:00，市场收盘 15:00；使用全天以捕获集合竞价到收盘的累积效应）
+事件窗口（含前后各 1 交易日缓冲）：
+  路演当日全日 [09:25, 15:00]；输出逐 5min bar 的 AR / AV 序列
+  （时间窗口切片由 cal_windows.py 完成）
 
 输出：
   carv/output/car_cav_results.csv
+  每行 = 1只竞争公司 × 1个事件 × 1个 5min bar
+  列：ipo_id, rival_fc, event_date, timestamp,
+      ar_est1, ar_est2, ar_est3,   # 逐 bar 异常收益（非累积）
+      av_est1, av_est2, av_est3    # 逐 bar 异常成交量（非累积）
 """
 
 import sys
@@ -27,7 +31,6 @@ import datetime as dt
 from pathlib import Path
 
 import multiprocessing as mp
-import pickle as _pickle
 
 import numpy as np
 import pandas as pd
@@ -65,8 +68,8 @@ for p in [str(RESAMPLE_DIR), str(CALCULATE_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 # print(sys.path)
-from cal_return import get_complete_return   # noqa: E402
-from indicator_cal import calculate_car, calculate_cav  # noqa: E402
+from cal_return import get_complete_return          # noqa: E402
+from indicator_cal import calculate_ar, calculate_av  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -80,9 +83,10 @@ EST2_END_OFFSET   = -5     # 包含
 EST3_START_OFFSET = -5     # 包含
 EST3_END_OFFSET   = -2     # 包含
 EVENT_START_OFFSET = -1
-EVENT_END_OFFSET   = 1     
-OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
-ERROR_LOG         = OUTPUT_DIR / "errors.txt"
+EVENT_END_OFFSET   = 1
+OUTPUT_FILE        = OUTPUT_DIR / "car_cav_results.csv"
+ERROR_LOG          = OUTPUT_DIR / "errors.txt"
+CPU_NUM            = int(os.getenv("SLURM_CPUS_PER_TASK", 4))
 
 # ── 工具函数 ──────────────────────────────────────────────────────
 
@@ -134,9 +138,11 @@ def log_error(msg: str):
 
 
 def build_params(start: pd.Timestamp, end: pd.Timestamp) -> dict:
+    # 将 end 推至当天末尾，确保该日所有 bar 都被加载
+    end_eod = end + pd.Timedelta(hours=23, minutes=59)
     return {
         "start": start.to_pydatetime(),
-        "end":   end.to_pydatetime(),
+        "end":   end_eod.to_pydatetime(),
         "freq":  FREQ,
         "base_dir": str(OUTPUT_DIR),
         "aggregated_base_path": str(AGGREGATED_PATH),
@@ -146,11 +152,10 @@ def build_params(start: pd.Timestamp, end: pd.Timestamp) -> dict:
 # ── 数据加载 ──────────────────────────────────────────────────────
 
 def load_roadshow_index() -> pd.DataFrame:
-    """加载路演索引，返回含 INDEX2009、Stkcd、roadshow_date 三列。"""
+    """加载路演索引，返回含 ipo_id、roadshow_date 列。"""
     df = pd.read_excel(INDEX_PATH, dtype=str)
     df["roadshow_date"] = pd.to_datetime(df["日期"], errors="coerce")
-    df["roadshow_start"] = df["开始时间"]    # 只保留必要的列，过滤掉缺失路演日期的行
-    df = df[["INDEX2009", "Stkcd", "roadshow_date", "roadshow_start"]].dropna(subset=["roadshow_date"])
+    df = df[["INDEX2009", "Stkcd", "roadshow_date"]].dropna(subset=["roadshow_date"])
     df.rename(columns={"INDEX2009": "ipo_id", "Stkcd": "ipo_stkcd_raw"}, inplace=True)
     return df
 
@@ -170,30 +175,31 @@ def compute_car_cav_for_rival(
     market_return: pd.DataFrame,
     start_needed: pd.Timestamp,
     end_needed: pd.Timestamp,
-    events: list[dict],
-) -> list[pd.DataFrame]:
+    events: list,
+) -> list:
     """
-    对单只竞争公司股票，批量计算所有关联事件的 CAR/CAV。
+    对单只竞争公司股票，批量计算所有关联事件的逐 bar AR / AV 序列。
 
     Parameters
     ----------
-    rival_fc     : full code, e.g. "SZ000089"
-    market_return: SH000300 收益率 DataFrame，需覆盖所需区间，列为 ['Return','Volume']
-    start_needed : 本竞争公司所有事件中最早的估计窗口开始日
-    end_needed   : 本竞争公司所有事件中最晚的事件窗口结束日
-    events       : list of dicts with keys:
-                   ipo_id, event_date,
-                   est1_start, est1_end,
-                   est2_start, est2_end,
-                   est3_start, est3_end
+    rival_fc      : full code, e.g. "SZ000089"
+    market_return : SH000300 收益率 DataFrame，列为 ['Return','Volume']
+    start_needed  : 本竞争公司所有事件中最早的估计窗口开始日
+    end_needed    : 本竞争公司所有事件中最晚的事件窗口结束日
+    events        : list of dicts with keys:
+                    ipo_id, event_date,
+                    est1_start, est1_end,
+                    est2_start, est2_end,
+                    est3_start, est3_end,
+                    event_start, event_end
 
     Returns
     -------
     list[pd.DataFrame]: 每个事件对应一个 DataFrame，列为
-        [timestamp, car_est1, car_est2, cav_est1, cav_est2, ipo_id, rival_fc, event_date]
-        行 = 事件窗口内的每个 5min 时间戳（累积值序列）
+        [timestamp, ar_est1, ar_est2, ar_est3, av_est1, av_est2, av_est3,
+         ipo_id, rival_fc, event_date]
+        行 = 事件窗口内的每个 5min 时间戳（非累积序列）
     """
-    # ── 加载竞争公司 5分钟收益率 ──
     params = build_params(start_needed, end_needed)
     rival_data = get_complete_return(rival_fc, is_index=False, params=params)
     if rival_data is None or rival_data.empty:
@@ -201,10 +207,8 @@ def compute_car_cav_for_rival(
             log_error(f"rival {rival_fc} | ipo_id {ev['ipo_id']} | no data")
         return []
 
-    # cal_return returns columns ['Return', 'Volume']; rename to lowercase for indicator_cal
     rival_data = rival_data.rename(columns={"Return": "return"})
-    # market_return: keep original columns, extract 'Return' Series for market arg
-    mkt_series = market_return["Return"]  # DatetimeIndex Series
+    mkt_series = market_return["Return"]
 
     results = []
     for ev in events:
@@ -212,8 +216,7 @@ def compute_car_cav_for_rival(
         ev_start_str = str(ev["event_start"].date())
         ev_end_str   = str(ev["event_end"].date())
         try:
-            # ── CAR （返回事件窗口内的 cumsum Series）──
-            car_est1 = calculate_car(
+            ar_est1 = calculate_ar(
                 stock_data=rival_data,
                 market_data=mkt_series,
                 event_start=ev_start_str,
@@ -221,7 +224,7 @@ def compute_car_cav_for_rival(
                 estimation_start=str(ev["est1_start"].date()),
                 estimation_end=str(ev["est1_end"].date()),
             )
-            car_est2 = calculate_car(
+            ar_est2 = calculate_ar(
                 stock_data=rival_data,
                 market_data=mkt_series,
                 event_start=ev_start_str,
@@ -229,7 +232,7 @@ def compute_car_cav_for_rival(
                 estimation_start=str(ev["est2_start"].date()),
                 estimation_end=str(ev["est2_end"].date()),
             )
-            car_est3 = calculate_car(
+            ar_est3 = calculate_ar(
                 stock_data=rival_data,
                 market_data=mkt_series,
                 event_start=ev_start_str,
@@ -238,8 +241,7 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est3_end"].date()),
             )
 
-            # ── CAV （返回事件窗口内的 cumsum Series）──
-            cav_est1 = calculate_cav(
+            av_est1 = calculate_av(
                 stock_data=rival_data,
                 event_start=ev_start_str,
                 event_end=ev_end_str,
@@ -247,7 +249,7 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est1_end"].date()),
                 volume_col="Volume",
             )
-            cav_est2 = calculate_cav(
+            av_est2 = calculate_av(
                 stock_data=rival_data,
                 event_start=ev_start_str,
                 event_end=ev_end_str,
@@ -255,7 +257,7 @@ def compute_car_cav_for_rival(
                 estimation_end=str(ev["est2_end"].date()),
                 volume_col="Volume",
             )
-            cav_est3 = calculate_cav(
+            av_est3 = calculate_av(
                 stock_data=rival_data,
                 event_start=ev_start_str,
                 event_end=ev_end_str,
@@ -264,28 +266,26 @@ def compute_car_cav_for_rival(
                 volume_col="Volume",
             )
 
-            # 将四个序列拼成一张宽表，行 = 事件窗口内的 5min 时间戳
             def _to_series(x, name):
-                """scalar NaN 或 Series 都可处理"""
                 if isinstance(x, pd.Series):
                     return x.rename(name)
                 return pd.Series([np.nan], name=name)
 
             df_ev = pd.concat(
-                [_to_series(car_est1, "car_est1"),
-                 _to_series(car_est2, "car_est2"),
-                 _to_series(car_est3, "car_est3"),
-                 _to_series(cav_est1, "cav_est1"),
-                 _to_series(cav_est2, "cav_est2"),
-                 _to_series(cav_est3, "cav_est3")],
+                [_to_series(ar_est1, "ar_est1"),
+                 _to_series(ar_est2, "ar_est2"),
+                 _to_series(ar_est3, "ar_est3"),
+                 _to_series(av_est1, "av_est1"),
+                 _to_series(av_est2, "av_est2"),
+                 _to_series(av_est3, "av_est3")],
                 axis=1,
             )
 
         except Exception as e:
             log_error(f"rival {rival_fc} | ipo_id {ev['ipo_id']} | event {ev_date_str} | {e}")
             df_ev = pd.DataFrame(
-                                [{"car_est1": np.nan, "car_est2": np.nan, "car_est3": np.nan,
-                                    "cav_est1": np.nan, "cav_est2": np.nan, "cav_est3": np.nan}]
+                [{"ar_est1": np.nan, "ar_est2": np.nan, "ar_est3": np.nan,
+                  "av_est1": np.nan, "av_est2": np.nan, "av_est3": np.nan}]
             )
 
         df_ev.index.name = "timestamp"
@@ -302,10 +302,10 @@ def compute_car_cav_for_rival(
 _worker_market_data: "pd.DataFrame | None" = None
 
 
-def _pool_init(market_pkl: bytes) -> None:
-    """Worker 初始化：将序列化的市场指数数据恢复为全局变量。"""
+def _pool_init(market_parquet_path: str) -> None:
+    """Worker 初始化：从 parquet 文件加载市场指数数据（避免每个 worker pickle 3.3g 数据）。"""
     global _worker_market_data
-    _worker_market_data = _pickle.loads(market_pkl)
+    _worker_market_data = pd.read_parquet(market_parquet_path)
 
 
 def _rival_task(args: tuple) -> tuple:
@@ -354,27 +354,21 @@ def main():
 
     print("计算交易日偏移（可能需要数分钟）...")
     unique_events = roadshow_idx[["ipo_id", "roadshow_date"]].drop_duplicates("ipo_id").copy()
-    unique_events["est1_start"] = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST1_START_OFFSET))
-    unique_events["est1_end"]   = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST1_END_OFFSET))
-    unique_events["est2_start"] = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST2_START_OFFSET))
-    unique_events["est2_end"]   = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST2_END_OFFSET))
-    unique_events["est3_start"] = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST3_START_OFFSET))
-    unique_events["est3_end"]    = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EST3_END_OFFSET))
-    unique_events["event_start"] = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EVENT_START_OFFSET))
-    unique_events["event_end"]   = unique_events["roadshow_date"].apply(
-        lambda d: safe_offset(d, EVENT_END_OFFSET))
 
-    # 过滤掉偏移计算失败的行
+    unique_events["est1_start"]  = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST1_START_OFFSET))
+    unique_events["est1_end"]    = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST1_END_OFFSET))
+    unique_events["est2_start"]  = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST2_START_OFFSET))
+    unique_events["est2_end"]    = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST2_END_OFFSET))
+    unique_events["est3_start"]  = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST3_START_OFFSET))
+    unique_events["est3_end"]    = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EST3_END_OFFSET))
+    unique_events["event_start"] = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EVENT_START_OFFSET))
+    unique_events["event_end"]   = unique_events["roadshow_date"].apply(lambda d: safe_offset(d, EVENT_END_OFFSET))
+
+    # 过滤掉交易日偏移计算失败的行
     unique_events = unique_events.dropna(
         subset=["est1_start", "est1_end", "est2_start", "est2_end",
-                "est3_start", "est3_end", "event_start", "event_end"])
+                "est3_start", "est3_end", "event_start", "event_end"]
+    )
 
     # 合并回 pairs
     pairs = pairs.merge(unique_events.drop(columns=["roadshow_date"]), on="ipo_id", how="inner")
@@ -393,8 +387,7 @@ def main():
         raise RuntimeError(f"无法加载市场指数 {MARKET_CODE}")
     print(f"市场指数共 {len(market_data):,} 条 5分钟数据")
 
-    # ── 按竞争公司分组，逐股计算 ──────────────────────────────────
-    # 断点续算：读取已有结果
+    # ── 断点续算：读取已有结果 ────────────────────────────
     if OUTPUT_FILE.exists():
         # existing = pd.read_csv(OUTPUT_FILE, usecols=["ipo_id", "rival_fc"])
         # done_keys = set(zip(existing["ipo_id"], existing["rival_fc"]))
@@ -402,9 +395,9 @@ def main():
         OUTPUT_FILE.unlink()  # TEMP:删除已有文件，重新计算全部配对
         done_keys = set()
     else:
-        done_keys = set()
+        done_keys: set = set()
 
-    # 筛掉已完成的
+    # 筛掉已完成的（此处全量重算）
     pairs["rival_fc_col"] = pairs["rival_stkcd"].apply(full_code)
     pairs_todo = pairs[
         ~pairs.apply(lambda r: (r["ipo_id"], r["rival_fc_col"]) in done_keys, axis=1)
@@ -412,7 +405,7 @@ def main():
     print(f"待计算配对：{len(pairs_todo):,}")
 
     # 按竞争公司分组
-    grouped = pairs_todo.groupby("rival_fc_col")
+    grouped      = pairs_todo.groupby("rival_fc_col")
     total_rivals = len(grouped)
     print(f"待加载竞争公司数：{total_rivals:,}")
 
@@ -431,29 +424,32 @@ def main():
         tasks.append((rival_fc, r_start, r_end, events))
 
     # ── 多进程并行计算 ────────────────────────────────────────────
-    market_pkl = _pickle.dumps(market_data)
-    n_workers = max(1, mp.cpu_count() - 1)
+    _market_tmp = OUTPUT_DIR / "_market_tmp.parquet"
+    market_data.to_parquet(_market_tmp)
+    market_parquet_path = str(_market_tmp)
+
+    n_workers = max(1, CPU_NUM - 1)
     print(f"使用 {n_workers} 个进程并行计算...")
 
-    all_results = []
+    all_results: list = []
     write_header = not OUTPUT_FILE.exists()
 
     with mp.Pool(
         processes=n_workers,
         initializer=_pool_init,
-        initargs=(market_pkl,),
+        initargs=(market_parquet_path,),
     ) as pool:
         for i, (rival_fc, records) in enumerate(
             pool.imap_unordered(_rival_task, tasks)
         ):
-            all_results.extend(records)
+            all_results.extend(records)   # records is list[pd.DataFrame]
 
             if (i + 1) % 100 == 0 or (i + 1) == total_rivals:
                 if all_results:
                     df_out = pd.concat(all_results, ignore_index=True)
                     cols_order = ["ipo_id", "rival_fc", "event_date", "timestamp",
-                                  "car_est1", "car_est2", "car_est3",
-                                  "cav_est1", "cav_est2", "cav_est3"]
+                                  "ar_est1", "ar_est2", "ar_est3",
+                                  "av_est1", "av_est2", "av_est3"]
                     df_out = df_out[[c for c in cols_order if c in df_out.columns]]
                     df_out.to_csv(
                         OUTPUT_FILE,
@@ -467,8 +463,13 @@ def main():
                 pct = (i + 1) / total_rivals * 100
                 print(f"  [{i+1:>5}/{total_rivals}] ({pct:.1f}%)  最近: {rival_fc}")
 
+    # 清理临时文件
+    if _market_tmp.exists():
+        _market_tmp.unlink()
+
     print(f"\n完成！结果保存于：{OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
     main()
+
