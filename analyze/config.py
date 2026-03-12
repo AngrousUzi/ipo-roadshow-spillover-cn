@@ -16,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # ─── 数据根目录 ──────────────────────────────────────────────────────
 # 视频/音频/转录都在此目录的子目录下
 if os.name == "nt":  # Windows 本地
-    DATA_ROOT = PROJECT_ROOT / "videos" / "archive"
+    DATA_ROOT = PROJECT_ROOT 
 else:               # HPC / Linux
     DATA_ROOT = Path("./")  # 当前工作目录，假设已切换到数据所在目录
 
