@@ -7,8 +7,8 @@ import sys
 import re
 import tempfile
 
-from polars import date
-from config import get_audio_dir, get_video_dir, get_trans_dir, DATA_ROOT,PROJECT_ROOT
+# from polars import date
+from config import get_audio_dir, get_video_dir, get_trans_dir, PROJECT_ROOT
 import os
 VIDEO_OUTPUT_DIR = PROJECT_ROOT / "路演视频"
 AUDIO_OUTPUT_DIR = PROJECT_ROOT / "路演音频"
@@ -22,14 +22,18 @@ if os.name == "nt":
     VIDEO_OPERATRION_PATH = PROJECT_ROOT / "videos"
     INDEX_PATH = PROJECT_ROOT / "anns" / "IPO_index_selected_platforms.xlsx"
     sys.path.insert(0, str(VIDEO_OPERATRION_PATH.resolve()))
-    from audio_extract import extract_tasks
+    from audio_extract import extract_task
     from audio_transcribe import transcribe_tasks
 else:
-    VIDEO_OPERATRION_PATH = PROJECT_ROOT / "roadshow-cn"
-    INDEX_PATH = PROJECT_ROOT / "IPO_index_selected_platforms.xlsx"
+    VIDEO_OPERATRION_PATH = PROJECT_ROOT / ".." / "roadshow-cn"
+    DATA_ROOT = PROJECT_ROOT/ ".." 
+    INDEX_PATH = DATA_ROOT / "IPO_index_selected_platforms.xlsx"
     sys.path.insert(0, str(VIDEO_OPERATRION_PATH.resolve()))
-    from audio_extract import extract_tasks
-    from audio_transcribe import transcribe_tasks
+    # print(f"已添加视频处理模块路径: {VIDEO_OPERATRION_PATH}")
+    from audio_extract import extract_task
+    # from audio_transcribe import transcribe_tasks
+
+
 
 def collect_video_tasks() -> list[tuple[str, Path | None]]:
     """
@@ -85,10 +89,11 @@ def collect_video_tasks() -> list[tuple[str, Path | None]]:
                         seg_map[int(num_match)] = vf
 
             video_paths = [seg_map[k] for k in seg_map]
-
-            if len(video_paths) != min(2, video_number):
+            
+            expected_count = min(2, video_number)
+            if len(video_paths) != expected_count:
                 print(
-                    f"[WARN] 预期 {video_number} 段，实际找到 {len(video_paths)} 段 "
+                    f"[WARN] 预期 {expected_count} 段，实际找到 {len(video_paths)} 段 "
                     f"(index={index2009}, code={code}, date={date}, platform={platform})"
                 )
 
@@ -112,9 +117,10 @@ def collect_video_tasks() -> list[tuple[str, Path | None]]:
                 m = re.search(r"_视频(\d+)", vf.name)
                 if m:
                     num_match = m.group(1)
-                    if num_match.isdigit() and num_match =="1" or num_match =="2":
+                    if code in ("001217", "301000", "301022", "301093", "301149", "301180", "301230") and num_match.isdigit() and num_match in ("1", "2", "3"):
                         seg_map[int(num_match)] = vf
-
+                    elif code =="301161" and num_match.isdigit() and num_match in ("1", "2"):
+                        seg_map[int(num_match)] = vf
             # 001217 华尔泰:3->2->1
             # 301000 肇民科技 3->2->1
             # 301022 海泰科 3->2->1
@@ -125,10 +131,10 @@ def collect_video_tasks() -> list[tuple[str, Path | None]]:
             # 301161 唯万密封 2->1
             video_paths = [seg_map[k] for k in sorted(seg_map,reverse=True)]
 
-
+            expected_count =3 if code in ("001217", "301000", "301022", "301093", "301149", "301180", "301230") else 2
             if len(video_paths)!=3 and code in ("001217", "301000", "301022", "301093", "301149", "301180", "301230") or len(video_paths)!=2 and code =="301161":
                 print(
-                    f"[WARN] 预期 {video_number} 段，实际找到 {len(video_paths)} 段 "
+                    f"[WARN] 预期 {expected_count} 段，实际找到 {len(video_paths)} 段 "
                     f"(index={index2009}, code={code}, date={date}, platform={platform})"
                 )
 
@@ -263,7 +269,7 @@ def concat_videos(video_paths: list[Path], output_path: Path):
         if err:
             err_str = err.decode("utf8", errors="ignore")
             if err_str.strip():
-                print(f"FFmpeg stderr: {err_str}")
+                print(f"{output_path}: FFmpeg stderr: {err_str}")
 
         temp_output_path.rename(output_path)
         return True
@@ -310,17 +316,24 @@ def concat_videos_with_retry(video_paths: list[Path], output_path: Path, max_ret
 if __name__ == "__main__":
     video_tasks = collect_video_tasks()
     # 将video序列提取音频
-
-    audio_tasks_to_extract= [AUDIO_OUTPUT_DIR / video_file.stem + ".wav" if video_file is not None else None for _, video_file in video_tasks]
+    with open (PROJECT_ROOT/"videos.txt", "wb") as f:
+        for video_task in video_tasks:
+            index2009, video_path = video_task
+            f.write(f"{index2009}\t{video_path}\n".encode("utf-8"))
+    audio_tasks_to_extract= [AUDIO_OUTPUT_DIR / (video_file.stem + ".wav") if video_file is not None else None for _, video_file in video_tasks]
     for video_task, audio_task in zip(video_tasks, audio_tasks_to_extract):
         index2009, video_path = video_task
         if video_path is not None:
-            output_audio_path = AUDIO_OUTPUT_DIR / f"{video_path.stem}.wav"
+            output_audio_path = AUDIO_OUTPUT_DIR / (video_path.stem + ".wav")
             if not output_audio_path.exists():
-                extract_tasks([(video_path, output_audio_path)])
+                extract_task((video_path, output_audio_path))
             else:
                 print(f"音频已存在，跳过提取: {output_audio_path}")
         else:
             print(f"[WARN] 路演 {index2009} 视频路径缺失，无法提取音频。")
             
     audio_tasks = collect_audio_tasks()
+    with open (PROJECT_ROOT/"audios.txt", "wb") as f:
+        for audio_task in audio_tasks:
+            index2009, audio_path = audio_task
+            f.write(f"{index2009}\t{audio_path}\n".encode("utf-8"))
