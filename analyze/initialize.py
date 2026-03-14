@@ -27,7 +27,7 @@ if os.name == "nt":  # Windows
     INDEX_PATH = PROJECT_ROOT / "anns" / "IPO_index_selected_platforms.xlsx"
     sys.path.insert(0, str(VIDEO_OPERATRION_PATH.resolve()))
     from audio_extract import extract_task
-    from audio_transcribe import transcribe_tasks
+    # from audio_transcribe import transcribe_tasks
 else:
     VIDEO_OPERATRION_PATH = PROJECT_ROOT / ".." / "roadshow-cn"
     DATA_ROOT = PROJECT_ROOT / ".."
@@ -162,7 +162,7 @@ def concat_videos(video_paths: list[Path], output_path: Path) -> tuple[bool, str
                 print(f"{output_path}: FFmpeg stderr: {err_decoded}")
                 error_str = err_decoded
 
-        temp_output_path.rename(output_path)
+        temp_output_path.replace(output_path)
         return True, error_str
     except ffmpeg.Error as e:
         lines = ["FFmpeg 执行失败:"]
@@ -214,6 +214,83 @@ def concat_videos_with_retry(
     return False, last_error
 
 
+def concat_videos_reencode(
+    video_paths: list[Path],
+    output_path: Path,
+    crf: int = 18,
+    audio_bitrate: str = "192k",
+    target_resolution: str = "1920:1080",
+    target_fps: int = 30,
+) -> tuple[bool, str]:
+    """
+    使用 ffmpeg filter_complex concat 重编码拼接视频。
+
+    统一缩放分辨率、帧率、音频采样率后再拼接，彻底规避编解码器类型
+    （H.264 vs HEVC）、time_base、SPS/PPS、profile/level 不一致引起的问题。
+
+    返回 (success, error_str)。
+    """
+    if not video_paths:
+        return False, "[ERROR] 未提供视频路径"
+
+    normalized = [Path(p) for p in video_paths]
+    missing = [str(p) for p in normalized if not p.exists()]
+    if missing:
+        return False, f"[ERROR] 视频文件不存在: {missing}"
+
+    n = len(normalized)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(output_path.stem + ".reencode.tmp" + output_path.suffix)
+
+    try:
+        if temp_path.exists():
+            temp_path.unlink()
+
+        # 每路视频流：统一分辨率、帧率、像素格式；音频：统一到立体声 44100Hz
+        v_filters = [
+            f"[{i}:v]scale={target_resolution},fps={target_fps},"
+            f"format=yuv420p,setsar=1[v{i}]"
+            for i in range(n)
+        ]
+        a_filters = [
+            f"[{i}:a:0]aformat=sample_rates=44100:channel_layouts=stereo[a{i}]"
+            for i in range(n)
+        ]
+        concat_in = "".join(f"[v{i}][a{i}]" for i in range(n))
+        concat_filter = f"{concat_in}concat=n={n}:v=1:a=1[outv][outa]"
+        filter_complex = ";".join(v_filters + a_filters + [concat_filter])
+
+        cmd = ["ffmpeg", "-y"]
+        for p in normalized:
+            cmd += ["-i", str(p)]
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-c:a", "aac", "-b:a", audio_bitrate,
+            "-movflags", "+faststart",
+            str(temp_path),
+        ]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore"
+        )
+        error_str = result.stderr.strip()
+
+        if result.returncode != 0:
+            if temp_path.exists():
+                temp_path.unlink()
+            return False, f"重编码失败 (exit {result.returncode}): {error_str}"
+
+        temp_path.replace(output_path)
+        return True, error_str
+
+    except Exception as e:
+        if temp_path.exists():
+            temp_path.unlink()
+        return False, f"重编码异常: {e}"
+
+
 # ── Multiprocessing worker ─────────────────────────────────────────────────────
 
 def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
@@ -237,8 +314,13 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
     if platform in ("上证", "中国证券网"):
         if output_path.exists():
             err = check_video_integrity(output_path)
-            if err=="":
+            if err == "":
                 return index2009, str(output_path), True, err
+            print(f"[WARN] 视频完整性检查报错: {output_path}")
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
 
         seg_map: dict[int, Path] = {}
         for vf in video_dir.glob(f"{code}_*_{date}_视频*.mp4"):
@@ -263,6 +345,19 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
 
         success, error_str = concat_videos_with_retry(video_paths, output_path)
         if success:
+            integrity_err = check_video_integrity(output_path)
+            if not integrity_err:
+                return index2009, str(output_path), True, error_str
+            print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            error_str = integrity_err
+        else:
+            print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
+        success, error_str = concat_videos_reencode(video_paths, output_path)
+        if success:
             return index2009, str(output_path), True, error_str
         return index2009, None, False, error_str
 
@@ -270,8 +365,13 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
     elif platform == "中证" and video_number > 1:
         if output_path.exists():
             err = check_video_integrity(output_path)
-            if err=="":
+            if err == "":
                 return index2009, str(output_path), True, err
+            print(f"[WARN] 视频完整性检查报错: {output_path}")
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
 
         seg_map: dict[int, Path] = {}
         for vf in video_dir.glob(f"{code}_*_{date}_视频*.mp4"):
@@ -306,6 +406,19 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
             return index2009, None, False, msg
 
         success, error_str = concat_videos_with_retry(video_paths, output_path)
+        if success:
+            integrity_err = check_video_integrity(output_path)
+            if not integrity_err:
+                return index2009, str(output_path), True, error_str
+            print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+            error_str = integrity_err
+        else:
+            print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
+        success, error_str = concat_videos_reencode(video_paths, output_path)
         if success:
             return index2009, str(output_path), True, error_str
         return index2009, None, False, error_str
