@@ -20,7 +20,7 @@ VIDEO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TRANS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-PARALLEL_PROCESSES = int(os.getenv("SLURM_CPUS_PER_TASK", "4"))
+PARALLEL_PROCESSES = int(os.getenv("SLURM_CPUS_PER_TASK", "16"))
 
 if os.name == "nt":  # Windows
     VIDEO_OPERATRION_PATH = PROJECT_ROOT / "videos"
@@ -83,13 +83,7 @@ def collect_audio_tasks() -> list[tuple[str, Path | None]]:
         code      = str(row.get(f"{platform}_去重代码", "")).strip()
         date      = str(row.get(f"{platform}_日期",     "")).strip()
 
-        audio_dir = get_audio_dir(platform)
-        if not audio_dir.exists():
-            print(f"[WARN] 音频目录不存在: {audio_dir}")
-            results.append((index2009, None))
-            continue
-
-        audio_path = audio_dir / f"{code}_{date}.wav"
+        audio_path = AUDIO_OUTPUT_DIR / f"{code}_{date}.wav"
         if not audio_path.exists():
             print(
                 f"[ERROR] 未找到音频文件: index={index2009} "
@@ -243,7 +237,8 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
     if platform in ("上证", "中国证券网"):
         if output_path.exists():
             err = check_video_integrity(output_path)
-            return index2009, str(output_path), True, err
+            if err=="":
+                return index2009, str(output_path), True, err
 
         seg_map: dict[int, Path] = {}
         for vf in video_dir.glob(f"{code}_*_{date}_视频*.mp4"):
@@ -275,7 +270,8 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
     elif platform == "中证" and video_number > 1:
         if output_path.exists():
             err = check_video_integrity(output_path)
-            return index2009, str(output_path), True, err
+            if err=="":
+                return index2009, str(output_path), True, err
 
         seg_map: dict[int, Path] = {}
         for vf in video_dir.glob(f"{code}_*_{date}_视频*.mp4"):
