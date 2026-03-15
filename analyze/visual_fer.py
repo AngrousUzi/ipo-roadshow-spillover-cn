@@ -23,6 +23,7 @@ analyze/visual_fer.py
 """
 
 from pathlib import Path
+import time
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
@@ -30,13 +31,15 @@ warnings.filterwarnings("ignore")
 try:
     from deepface import DeepFace
     _DEEPFACE_OK = True
-except ImportError:
+    _DEEPFACE_ERR = ""
+except Exception as e:
     _DEEPFACE_OK = False
+    _DEEPFACE_ERR = str(e)
 
 try:
     from fer import FER
     _FER_OK = True
-except ImportError:
+except Exception:
     _FER_OK = False
 
 try:
@@ -155,7 +158,10 @@ def extract_visual_emotions(
         return result
 
     if not _DEEPFACE_OK and not _FER_OK:
-        result["error"] = "deepface 和 fer 均未安装"
+        if _DEEPFACE_ERR:
+            result["error"] = f"deepface 不可用: {_DEEPFACE_ERR}; fer 也不可用"
+        else:
+            result["error"] = "deepface 和 fer 均未安装"
         return result
 
     if not video_path.exists():
@@ -233,7 +239,10 @@ def extract_visual_emotions(
 
 if __name__ == "__main__":
     import argparse
-    video_path = Path("sample_pitch.mp4")  # 替换为实际视频路径
+    start_time = time.time()
+    video_path = Path("上证路演视频/600025_华能水电_2017-12-04_视频1_华能水电首次公开发行A股网上路演开场致辞.mp4")  # 替换为实际视频路径
 
-    res = extract_visual_emotions(video_path)
+    res = extract_visual_emotions(video_path, sample_fps=1)
     print(res)
+    end_time = time.time()
+    print(f"分析耗时: {end_time - start_time:.2f} 秒")

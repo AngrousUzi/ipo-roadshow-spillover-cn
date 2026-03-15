@@ -31,7 +31,7 @@ from vocal_features import extract_vocal_features
 
 OUTPUT_FILE      = OUTPUT_DIR / "vocal_features.csv"
 PARALLEL_PROCS   = int(os.getenv("SLURM_CPUS_PER_TASK", "4"))
-
+INDEXED_AUDIO_DIR = OUTPUT_DIR / ".." / "路演音频"
 
 # ─── Worker ────────────────────────────────────────────────────────────
 
@@ -73,6 +73,16 @@ def collect_tasks(done_stems: set) -> list[str]:
                 tasks.append(str(wav))
     return tasks
 
+def collect_index_tasks() -> list[str]:
+    """收集所有待处理的 index 文件路径（字符串），跳过已完成的。"""
+    tasks = []
+    audio_dir = INDEXED_AUDIO_DIR
+    if not audio_dir.exists():
+        print(f"[SKIP] 目录不存在: {audio_dir}")
+    if audio_dir.exists():
+        for wav in audio_dir.glob("*.wav"):
+            tasks.append(str(wav))
+    return tasks
 
 def main():
     print("═" * 60)
@@ -86,7 +96,8 @@ def main():
         done_stems = set(existing["file_stem"].tolist())
         print(f"已有 {len(done_stems)} 条结果，将跳过已处理文件。")
 
-    tasks = collect_tasks(done_stems)
+    # tasks = collect_tasks(done_stems)
+    tasks = collect_index_tasks()
     print(f"待处理文件数：{len(tasks)}")
 
     if not tasks:

@@ -83,7 +83,7 @@ def collect_audio_tasks() -> list[tuple[str, Path | None]]:
         code      = str(row.get(f"{platform}_去重代码", "")).strip()
         date      = str(row.get(f"{platform}_日期",     "")).strip()
 
-        audio_path = AUDIO_OUTPUT_DIR / f"{code}_{date}.wav"
+        audio_path = AUDIO_OUTPUT_DIR / f"{index2009}_{code}_{date}.wav"
         if not audio_path.exists():
             print(
                 f"[ERROR] 未找到音频文件: index={index2009} "
@@ -330,7 +330,7 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
                 if num_match.isdigit() and num_match in ("1", "2"):
                     seg_map[int(num_match)] = vf
 
-        video_paths = [seg_map[k] for k in seg_map]
+        video_paths = [seg_map[k] for k in sorted(seg_map)]
         expected_count = min(2, video_number)
         if len(video_paths) != expected_count:
             print(

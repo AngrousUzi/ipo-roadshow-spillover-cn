@@ -29,7 +29,7 @@ from config import (
 from visual_fer import extract_visual_emotions
 
 OUTPUT_FILE = OUTPUT_DIR / "visual_fer.csv"
-
+INDEXED_VIDEO_DIR = OUTPUT_DIR / ".." / "路演视频"
 
 def collect_tasks(done_stems: set) -> list[Path]:
     tasks = []
@@ -43,6 +43,16 @@ def collect_tasks(done_stems: set) -> list[Path]:
                 tasks.append(mp4)
     return tasks
 
+def collect_index_tasks() -> list[Path]:
+    """收集所有待处理的 index 视频文件路径，跳过已完成的。"""
+    tasks = []
+    video_dir = INDEXED_VIDEO_DIR
+    if not video_dir.exists():
+        print(f"[SKIP] 目录不存在: {video_dir}")
+    if video_dir.exists():
+        for mp4 in video_dir.glob("*.mp4"):
+            tasks.append(mp4)
+    return tasks
 
 def main():
     print("═" * 60)
@@ -56,7 +66,8 @@ def main():
         done_stems = set(existing["file_stem"].tolist())
         print(f"已有 {len(done_stems)} 条结果，将跳过已处理文件。")
 
-    tasks = collect_tasks(done_stems)
+    # tasks = collect_tasks(done_stems)
+    tasks = collect_index_tasks()
     print(f"待处理文件数：{len(tasks)}\n")
 
     if not tasks:

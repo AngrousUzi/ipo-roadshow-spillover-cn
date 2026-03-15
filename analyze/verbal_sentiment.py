@@ -28,6 +28,7 @@ analyze/verbal_sentiment.py
 import json
 import re
 from pathlib import Path
+import time
 from typing import Optional
 
 try:
@@ -228,5 +229,8 @@ def analyze_verbal_sentiment(
 
 if __name__ == "__main__":
     json_path = Path("sample_transcript.json")  # 替换为实际 JSON 路径
+    start_time=time.time()
     res = analyze_verbal_sentiment(json_path)
+    end_time=time.time()
     print(res)
+    print(f"分析耗时: {end_time - start_time:.2f} 秒")

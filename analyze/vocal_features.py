@@ -169,7 +169,13 @@ def extract_vocal_features(
 
 if __name__ == "__main__":
     # 示例：处理单个文件
-    wav_path = Path("example.wav")
-    transcript_json_path = Path("example.json")
+    import time
+    
+    wav_path = Path("IR路演音频/003030_祖名股份_2020-12-22.wav")
+    transcript_json_path = Path("IR路演转录/003030_祖名股份_2020-12-22.json")
+    start_time = time.time()
     features = extract_vocal_features(wav_path, transcript_json_path)
+    end_time = time.time()
+
     print(features)
+    print(f"提取耗时: {end_time - start_time:.2f} 秒")
