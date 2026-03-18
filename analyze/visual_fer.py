@@ -60,11 +60,17 @@ import numpy as np
 import cv2 as _cv2
 
 # GPU 路径：facenet-pytorch（MTCNN）+ hsemotion（情绪分类器）
-import torch as _torch
-from facenet_pytorch import MTCNN as _MTCNN
-from hsemotion.facial_emotions import HSEmotionRecognizer as _HSEmo
-from torchvision import transforms as _transforms
-from PIL import Image as _PILImage
+# 使用 try/except 保护，缺少库时回退到 CPU 模式
+try:
+    import torch as _torch
+    from facenet_pytorch import MTCNN as _MTCNN
+    from hsemotion.facial_emotions import HSEmotionRecognizer as _HSEmo
+    from torchvision import transforms as _transforms
+    from PIL import Image as _PILImage
+    _GPU_LIBS_OK = True
+except ImportError as _e:
+    print(f"[FER] GPU 库缺失（{_e}），将使用 CPU 回退模式。")
+    _GPU_LIBS_OK = False
 
 
 # ─── 情绪类别映射 ─────────────────────────────────────────────────────
@@ -412,6 +418,16 @@ def extract_visual_emotions_from_frames(
     if engine is not None:
         emo_list = engine.analyze_frames(frames)
         return _aggregate_emotion_results(emo_list, stem, method="gpu_batch")
+
+    # GPU 不可用时返回错误结果（而非 None）
+    return dict(
+        file_stem=stem, positive_ratio=nan, negative_ratio=nan,
+        neutral_ratio=nan, net_positive=nan,
+        **{f"emo_{k}": nan for k in _EMO8_KEYS},
+        frames_analyzed=len(frames), frames_with_face=0,
+        face_detect_rate=nan, method="unavailable",
+        error="GPU 引擎不可用（facenet-pytorch / hsemotion 未安装）",
+    )
 
 
 # ─── 保留原始接口（向后兼容）─────────────────────────────────────────
