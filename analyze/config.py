@@ -36,6 +36,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 视觉分析：每秒采样帧数（越高越精确，越慢）
 VISUAL_SAMPLE_FPS = 1.0
 
+# GPU 批推理配置（visual_fer.py GPU 模式）
+GPU_DEVICE     = "cuda"   # "cuda" 或 "cpu"；代码内自动检测是否有 CUDA
+GPU_BATCH_SIZE = 32       # 每批送入 GPU 的帧数（显存 8GB 建议 32，16GB 可用 64）
+# 采样帧缓冲时的长边分辨率上限（缩小以节省内存；人脸检测不需要全分辨率）
+FRAME_MAX_LONG_SIDE = 720
+
 # 音频分析：librosa
 AUDIO_SR = 16000          # 目标采样率（与 audio_extract.py 一致）
 HOP_LENGTH = 512          # STFT hop length
