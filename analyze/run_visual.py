@@ -38,7 +38,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
-    PLATFORM_LIST, OUTPUT_DIR,
+    PLATFORM_LIST, OUTPUT_DIR, PROJECT_ROOT,
     VISUAL_SAMPLE_FPS, GPU_DEVICE, GPU_BATCH_SIZE, FRAME_MAX_LONG_SIDE,
     get_video_dir,
 )
@@ -48,7 +48,7 @@ from visual_gaze import extract_gaze_from_frames
 # ─── 输出文件 ─────────────────────────────────────────────────────────
 FER_OUTPUT_FILE   = OUTPUT_DIR / "visual_fer.csv"
 GAZE_OUTPUT_FILE  = OUTPUT_DIR / "visual_gaze.csv"
-INDEXED_VIDEO_DIR = OUTPUT_DIR / ".." / "路演视频"
+INDEXED_VIDEO_DIR = PROJECT_ROOT / "路演视频"
 
 # ─── 运行开关 ─────────────────────────────────────────────────────────
 RUN_FER  = True    # 是否运行表情识别（GPU）
