@@ -57,20 +57,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
-
-try:
-    import cv2 as _cv2
-    _CV2_OK = True
-except ImportError:
-    _CV2_OK = False
-    print("[WARNING] opencv-python 未安装。pip install opencv-python")
-
-try:
-    import mediapipe as _mp
-    _MP_OK = True
-except ImportError:
-    _MP_OK = False
-    print("[WARNING] mediapipe 未安装，gaze 模块不可用。pip install mediapipe")
+import cv2 as _cv2
+import mediapipe as _mp
 
 
 # ─── 阈值常量 ──────────────────────────────────────────────────────────
@@ -101,6 +89,32 @@ _MODEL_POINTS = np.array([
     [-150.0, -150.0, -125.0],
     [150.0,  -150.0, -125.0],
 ], dtype=np.float64)
+
+
+# ─── FaceLandmarker 模型自动下载 ──────────────────────────────────────
+
+_FACE_LANDMARKER_TASK_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+_FACE_LANDMARKER_TASK_LOCAL = (
+    Path.home() / ".cache" / "mediapipe" / "face_landmarker.task"
+)
+
+
+def _get_face_landmarker_model() -> str:
+    """
+    返回 face_landmarker.task 本地路径。
+    若文件不存在则从官方 URL 下载（约 7 MB）后缓存。
+    """
+    dst = _FACE_LANDMARKER_TASK_LOCAL
+    if not dst.exists():
+        import urllib.request
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[Gaze] 正在下载 face_landmarker.task → {dst}")
+        urllib.request.urlretrieve(_FACE_LANDMARKER_TASK_URL, dst)
+        print("[Gaze] 模型下载完成。")
+    return str(dst)
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────
@@ -188,21 +202,31 @@ class GazeEngine:
         self.gaze_threshold_h = gaze_threshold_h
         self.gaze_threshold_v = gaze_threshold_v
         self.head_yaw_thresh  = head_yaw_thresh
-        self._face_mesh       = None
+        self._landmarker      = None   # mp.tasks.vision.FaceLandmarker 实例
+        self._running_mode    = None
 
-    def _ensure_mesh(self):
-        if self._face_mesh is None:
-            if not _MP_OK:
-                raise ImportError("mediapipe 未安装")
-            import mediapipe as mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                refine_landmarks=True,
-                max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        return self._face_mesh
+    def _ensure_landmarker(self):
+        """懒加载 FaceLandmarker（MediaPipe 0.10+ Tasks API）。"""
+        if self._landmarker is not None:
+            return
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+
+        base_opts = mp_python.BaseOptions(
+            model_asset_path=_get_face_landmarker_model(),
+        )
+        opts = mp_vision.FaceLandmarkerOptions(
+            base_options=base_opts,
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
+        )
+        self._landmarker = mp_vision.FaceLandmarker.create_from_options(opts)
 
     def analyze_frame(
         self,
@@ -214,15 +238,19 @@ class GazeEngine:
         返回 dict(gaze_x, gaze_y, yaw, pitch, at_camera) 或 None（无人脸）。
         """
         import cv2
-        face_mesh = self._ensure_mesh()
+        import mediapipe as mp
+        self._ensure_landmarker()
         h, w = frame_bgr.shape[:2]
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        mp_result = face_mesh.process(rgb)
-        if not mp_result.multi_face_landmarks:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        detection = self._landmarker.detect(mp_image)
+
+        if not detection.face_landmarks:
             return None
 
-        lms = mp_result.multi_face_landmarks[0].landmark
+        # FaceLandmarker 返回 NormalizedLandmark 列表（x/y/z 均归一化）
+        lms = detection.face_landmarks[0]
 
         gx_l, gy_l = _eye_gaze_ratio(lms, _LEFT_IRIS,  _LEFT_EYE_CORNERS,  _LEFT_EYE_VERTICAL,  w, h)
         gx_r, gy_r = _eye_gaze_ratio(lms, _RIGHT_IRIS, _RIGHT_EYE_CORNERS, _RIGHT_EYE_VERTICAL, w, h)
@@ -238,12 +266,12 @@ class GazeEngine:
                     at_camera=(gaze_ok and head_ok))
 
     def close(self):
-        if self._face_mesh is not None:
+        if self._landmarker is not None:
             try:
-                self._face_mesh.close()
+                self._landmarker.close()
             except Exception:
                 pass
-            self._face_mesh = None
+            self._landmarker = None
 
     def __enter__(self):
         return self
@@ -291,10 +319,6 @@ def extract_gaze_from_frames(
         method               = "unavailable",
         error                = "",
     )
-
-    if not _CV2_OK or not _MP_OK:
-        result["error"] = "opencv 或 mediapipe 未安装"
-        return result
 
     if not frames:
         result["error"] = "帧列表为空"

@@ -55,43 +55,16 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 
-# ─── 可选依赖检测 ─────────────────────────────────────────────────────
+# ─── 依赖导入 ─────────────────────────────────────────────────────────
 
-try:
-    import cv2 as _cv2
-    _CV2_OK = True
-except ImportError:
-    _CV2_OK = False
-    print("[WARNING] opencv-python 未安装。pip install opencv-python")
+import cv2 as _cv2
 
 # GPU 路径：facenet-pytorch（MTCNN）+ hsemotion（情绪分类器）
-try:
-    import torch as _torch
-    from facenet_pytorch import MTCNN as _MTCNN
-    from hsemotion.facial_emotions import HSEmotionRecognizer as _HSEmo
-    from torchvision import transforms as _transforms
-    from PIL import Image as _PILImage
-    _GPU_LIBS_OK = True
-except ImportError:
-    _GPU_LIBS_OK = False
-
-_GPU_AVAILABLE = _GPU_LIBS_OK and _torch.cuda.is_available() if _GPU_LIBS_OK else False
-
-# CPU 回退：DeepFace
-try:
-    from deepface import DeepFace
-    _DEEPFACE_OK = True
-    _DEEPFACE_ERR = ""
-except Exception as e:
-    _DEEPFACE_OK = False
-    _DEEPFACE_ERR = str(e)
-
-# CPU 回退 2：fer
-try:
-    from fer import FER as _FER
-    _FER_OK = True
-except Exception:
-    _FER_OK = False
+import torch as _torch
+from facenet_pytorch import MTCNN as _MTCNN
+from hsemotion.facial_emotions import HSEmotionRecognizer as _HSEmo
+from torchvision import transforms as _transforms
+from PIL import Image as _PILImage
 
 
 # ─── 情绪类别映射 ─────────────────────────────────────────────────────
@@ -301,8 +274,6 @@ def read_sampled_frames(
 
     动机：FER 和 Gaze 共享同一帧列表，视频只读一遍。
     """
-    if not _CV2_OK:
-        raise ImportError("opencv-python 未安装")
     import cv2
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -439,69 +410,8 @@ def extract_visual_emotions_from_frames(
     # ── GPU 模式 ────────────────────────────────────────────────────
     engine = _get_gpu_engine(device=device, batch_size=batch_size)
     if engine is not None:
-        try:
-            emo_list = engine.analyze_frames(frames)
-            return _aggregate_emotion_results(emo_list, stem, method="gpu_batch")
-        except Exception as e:
-            # GPU 失败则回退 CPU
-            print(f"[FER] GPU 推理异常（{e}），回退 CPU。")
-
-    # ── CPU 模式：DeepFace ──────────────────────────────────────────
-    if not _CV2_OK:
-        return dict(
-            file_stem=stem, positive_ratio=nan, negative_ratio=nan,
-            neutral_ratio=nan, net_positive=nan,
-            frames_analyzed=len(frames), frames_with_face=0,
-            face_detect_rate=nan, method="unavailable",
-            error="opencv 未安装",
-        )
-
-    import cv2
-
-    # 初始化 FER 检测器（需要时）
-    fer_detector = None
-    if not _DEEPFACE_OK and _FER_OK:
-        fer_detector = _FER(mtcnn=False)
-    elif not _DEEPFACE_OK and not _FER_OK:
-        return dict(
-            file_stem=stem, positive_ratio=nan, negative_ratio=nan,
-            neutral_ratio=nan, net_positive=nan,
-            frames_analyzed=len(frames), frames_with_face=0,
-            face_detect_rate=nan, method="unavailable",
-            error="DeepFace 和 FER 均不可用",
-        )
-
-    method = "deepface" if _DEEPFACE_OK else "fer"
-    emo_list: list[dict | None] = []
-
-    for frame in frames:
-        try:
-            if _DEEPFACE_OK:
-                res = DeepFace.analyze(
-                    frame, actions=["emotion"],
-                    enforce_detection=False,
-                    detector_backend="opencv",
-                    silent=True,
-                )
-                if isinstance(res, list):
-                    res = res[0]
-                dominant = res.get("dominant_emotion", None)
-                if dominant:
-                    norm = _CPU_ALIAS.get(dominant.lower(), dominant.lower())
-                    emo_list.append({norm: 1.0})   # 离散：仅主导情绪置 1
-                else:
-                    emo_list.append(None)
-            else:
-                top = fer_detector.top_emotion(frame)
-                if top:
-                    norm = _CPU_ALIAS.get(top[0].lower(), top[0].lower())
-                    emo_list.append({norm: 1.0})
-                else:
-                    emo_list.append(None)
-        except Exception:
-            emo_list.append(None)
-
-    return _aggregate_emotion_results(emo_list, stem, method=method)
+        emo_list = engine.analyze_frames(frames)
+        return _aggregate_emotion_results(emo_list, stem, method="gpu_batch")
 
 
 # ─── 保留原始接口（向后兼容）─────────────────────────────────────────
