@@ -172,9 +172,9 @@ def _estimate_head_pose(
     rmat, _ = cv2.Rodrigues(rvec)
     sy = np.sqrt(rmat[0, 0] ** 2 + rmat[1, 0] ** 2)
     if sy > 1e-6:
-        pitch = np.arctan2(-rmat[2, 0], sy)
-        yaw   = np.arctan2(rmat[2, 1], rmat[2, 2])
-        roll  = np.arctan2(rmat[1, 0], rmat[0, 0])
+        pitch = np.arctan2(-rmat[2, 0], sy)          # 俯仰（上下点头）
+        roll  = np.arctan2(rmat[2, 1], rmat[2, 2])   # 横滚（头部左右倾斜）
+        yaw   = np.arctan2(rmat[1, 0], rmat[0, 0])   # 偏航（水平左右转向）★核心指标
     else:
         pitch = np.arctan2(-rmat[2, 0], sy)
         yaw   = 0.0
