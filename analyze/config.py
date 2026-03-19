@@ -43,7 +43,7 @@ VISUAL_SAMPLE_FPS = 12
 
 # GPU 批推理配置（visual_fer.py GPU 模式）
 GPU_DEVICE     = "cuda"   # "cuda" 或 "cpu"；代码内自动检测是否有 CUDA
-GPU_BATCH_SIZE = 512       # 每批送入 GPU 的帧数（显存 8GB 建议 32，16GB 可用 64）
+GPU_BATCH_SIZE = 1024      # 每批送入 GPU 的帧数（按当前任务统一为 1024）
 # 采样帧缓冲时的长边分辨率上限（缩小以节省内存；人脸检测不需要全分辨率）
 FRAME_MAX_LONG_SIDE = 720
 
