@@ -39,7 +39,7 @@ def _worker(json_path_str: str) -> dict:
         print(f"[WARN] {json_path.name}: {result['error']}")
     else:
         print(f"[OK]   {json_path.name}  method={result['method']}  "
-              f"tone={result['tone_score']:.4f}")
+              f"ann_tone={result['ann_tone_score']:.4f}")
     return result
 
 

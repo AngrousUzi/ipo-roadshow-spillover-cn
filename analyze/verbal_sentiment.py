@@ -152,7 +152,7 @@ def analyze_with_lexicons(text: str, lexicons: dict) -> dict:
     返回 keys：
         ann_positive_ratio, ann_negative_ratio, ann_tone_score,
         social_positive_ratio, social_negative_ratio, social_tone_score,
-        competition_ratio, prospect_ratio, policy_ratio,
+        competition_ratio, prospect_ratio, policy_pos_ratio, policy_neg_ratio,
         total_words, method
     """
     tokens = _tokenize(text)
