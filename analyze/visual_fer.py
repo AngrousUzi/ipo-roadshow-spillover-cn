@@ -87,7 +87,7 @@ _CPU_ALIAS = {
 # HSEmotion 的 8 类标签（EfficientNet B0 vgaf 版本）
 # Anger / Contempt / Disgust / Fear / Happiness / Neutral / Sadness / Surprise
 _HSE_ALIAS = {
-    "Anger": "angry", "Contempt": "neutral", "Disgust": "disgust",
+    "Anger": "angry", "Contempt": "contempt", "Disgust": "disgust",
     "Fear": "fear", "Happiness": "happy", "Neutral": "neutral",
     "Sadness": "sad", "Surprise": "surprise",
 }
@@ -136,6 +136,17 @@ class _FERGpuEngine:
             device=str(dev),
         )
         self.classes: list[str] = list(self.fer_model.idx_to_class.values())
+
+        # HSEmotion 将分类头的权重存储在 classifier_weights / classifier_bias，
+        # 而 fer_model.model 的 classifier 层被替换为 Identity（输出 1280-dim 特征）。
+        # 必须手动应用线性层才能得到 8 类 logits，否则对 1280-dim 做 softmax
+        # 会得到约 1/1280 ≈ 0.00078 的均匀极小值。
+        self._cls_weight = _torch.tensor(
+            self.fer_model.classifier_weights, dtype=_torch.float32
+        ).to(dev)   # [8, 1280]
+        self._cls_bias = _torch.tensor(
+            self.fer_model.classifier_bias, dtype=_torch.float32
+        ).to(dev)   # [8]
 
         # 情绪分类的预处理（224×224，ImageNet 归一化）
         self._preprocess = _transforms.Compose([
@@ -209,9 +220,11 @@ class _FERGpuEngine:
         batch_t = _torch.stack(tensors).to(self.device)
 
         with _torch.no_grad():
-            # 直接调用模型（不经过 HSEmotion 的单张接口，实现真正 batch forward）
-            logits = self.fer_model.model(batch_t)           # [N, 8]
-            probs  = _torch.softmax(logits, dim=1).cpu().numpy()
+            # fer_model.model 的 classifier 被替换为 Identity，输出 1280-dim 特征。
+            # 需手动应用线性分类头才能得到 8 类 logits。
+            features = self.fer_model.model(batch_t)                    # [N, 1280]
+            logits   = features @ self._cls_weight.T + self._cls_bias   # [N, 8]
+            probs    = _torch.softmax(logits, dim=1).cpu().numpy()
 
         for k, idx in enumerate(valid_indices):
             prob_dict = {}

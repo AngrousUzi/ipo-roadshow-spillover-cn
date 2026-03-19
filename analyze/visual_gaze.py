@@ -63,10 +63,13 @@ import mediapipe as _mp
 
 # ─── 阈值常量 ──────────────────────────────────────────────────────────
 
-GAZE_THRESHOLD_H  = 0.15   # 水平凝视偏移上限（眼宽归一化，0=正中）
-GAZE_THRESHOLD_V  = 0.15   # 垂直凝视偏移上限
-HEAD_YAW_THRESH   = 15.0   # 头部水平偏转上限（度）
-HEAD_PITCH_THRESH = 15.0   # 头部俯仰偏转上限（度）
+GAZE_THRESHOLD_H  = 0.15        # 水平凝视偏移上限（眼宽归一化，0=正中）
+GAZE_THRESHOLD_V  = 0.15        # 垂直凝视偏移上限
+HEAD_YAW_THRESH   = 15.0        # 默认头部水平偏转上限（度），仅供旧接口兼容
+HEAD_PITCH_THRESH = 15.0        # 头部俯仰偏转上限（度）
+
+# 同时输出多个 yaw 阈值下的指标，方便后续分析时选择
+YAW_THRESHOLDS = [5, 10, 15, 20]
 
 
 # ─── MediaPipe 关键点索引 ───────────────────────────────────────────────
@@ -301,23 +304,28 @@ def extract_gaze_from_frames(
     视频只读一遍，FER（GPU）和 Gaze（CPU）在同一帧缓冲上并发运行。
     """
     nan = float("nan")
+
+    # 多阈值列名预生成
+    multi_thresh_fields = {}
+    for t in YAW_THRESHOLDS:
+        multi_thresh_fields[f"head_frontal_ratio_{t}"]   = nan
+        multi_thresh_fields[f"gaze_at_camera_ratio_{t}"] = nan
+
     result = dict(
-        file_stem            = stem,
-        gaze_at_camera_ratio = nan,
-        gaze_x_mean          = nan,
-        gaze_x_std           = nan,
-        gaze_y_mean          = nan,
-        gaze_y_std           = nan,
-        head_yaw_mean        = nan,
-        head_yaw_std         = nan,
-        head_pitch_mean      = nan,
-        head_pitch_std       = nan,
-        head_frontal_ratio   = nan,
-        combined_attn_ratio  = nan,
-        frames_analyzed      = len(frames),
-        frames_with_face     = 0,
-        method               = "unavailable",
-        error                = "",
+        file_stem        = stem,
+        gaze_x_mean      = nan,
+        gaze_x_std       = nan,
+        gaze_y_mean      = nan,
+        gaze_y_std       = nan,
+        head_yaw_mean    = nan,
+        head_yaw_std     = nan,
+        head_pitch_mean  = nan,
+        head_pitch_std   = nan,
+        **multi_thresh_fields,
+        frames_analyzed  = len(frames),
+        frames_with_face = 0,
+        method           = "unavailable",
+        error            = "",
     )
 
     if not frames:
@@ -333,11 +341,9 @@ def extract_gaze_from_frames(
         [0,         0,         1          ],
     ], dtype=np.float64)
 
-    gaze_x_list = []
-    gaze_y_list = []
-    yaw_list    = []
-    pitch_list  = []
-    at_cam_list = []
+    # 每帧存 (gaze_x, gaze_y, yaw, pitch)，yaw/pitch 可为 nan（solvePnP 失败时）
+    # 统一对齐，方便后续对任意阈值组合逐帧计算
+    frame_data: list[tuple] = []
 
     try:
         with GazeEngine(gaze_threshold_h, gaze_threshold_v, head_yaw_thresh) as engine:
@@ -345,36 +351,46 @@ def extract_gaze_from_frames(
                 fr = engine.analyze_frame(frame, cam_matrix)
                 if fr is None:
                     continue
-                result["frames_with_face"] += 1
-                gaze_x_list.append(fr["gaze_x"])
-                gaze_y_list.append(fr["gaze_y"])
-                if not np.isnan(fr["yaw"]):
-                    yaw_list.append(fr["yaw"])
-                    pitch_list.append(fr["pitch"])
-                at_cam_list.append(1 if fr["at_camera"] else 0)
+                frame_data.append((fr["gaze_x"], fr["gaze_y"], fr["yaw"], fr["pitch"]))
     except Exception as e:
         result["error"] = str(e)
         return result
 
-    result["method"] = "mediapipe"
+    result["method"]           = "mediapipe"
+    result["frames_with_face"] = len(frame_data)
 
-    if gaze_x_list:
-        result["gaze_x_mean"] = float(np.mean(gaze_x_list))
-        result["gaze_x_std"]  = float(np.std(gaze_x_list))
-        result["gaze_y_mean"] = float(np.mean(gaze_y_list))
-        result["gaze_y_std"]  = float(np.std(gaze_y_list))
+    if not frame_data:
+        return result
 
-    if at_cam_list:
-        result["gaze_at_camera_ratio"] = float(np.mean(at_cam_list))
-        result["combined_attn_ratio"]  = result["gaze_at_camera_ratio"]
+    gaze_x_arr = np.array([d[0] for d in frame_data])
+    gaze_y_arr = np.array([d[1] for d in frame_data])
+    yaw_arr    = np.array([d[2] for d in frame_data])   # nan 表示 solvePnP 失败
+    pitch_arr  = np.array([d[3] for d in frame_data])
 
-    if yaw_list:
-        result["head_yaw_mean"]    = float(np.mean(yaw_list))
-        result["head_yaw_std"]     = float(np.std(yaw_list))
-        result["head_pitch_mean"]  = float(np.mean(pitch_list))
-        result["head_pitch_std"]   = float(np.std(pitch_list))
-        frontal = [1 if abs(y) < head_yaw_thresh else 0 for y in yaw_list]
-        result["head_frontal_ratio"] = float(np.mean(frontal))
+    # ── 凝视均值 / 标准差（所有有人脸帧）────────────────────────────────
+    result["gaze_x_mean"] = float(np.mean(gaze_x_arr))
+    result["gaze_x_std"]  = float(np.std(gaze_x_arr))
+    result["gaze_y_mean"] = float(np.mean(gaze_y_arr))
+    result["gaze_y_std"]  = float(np.std(gaze_y_arr))
+
+    # ── 头部姿态统计（仅 solvePnP 成功帧）────────────────────────────────
+    valid_mask = ~np.isnan(yaw_arr)
+    if valid_mask.any():
+        result["head_yaw_mean"]   = float(np.mean(yaw_arr[valid_mask]))
+        result["head_yaw_std"]    = float(np.std(yaw_arr[valid_mask]))
+        result["head_pitch_mean"] = float(np.mean(pitch_arr[valid_mask]))
+        result["head_pitch_std"]  = float(np.std(pitch_arr[valid_mask]))
+
+    # ── 多阈值指标（对所有有人脸帧逐一计算）──────────────────────────────
+    # head_frontal_ratio_T : solvePnP 成功帧中 |yaw| < T 的比例
+    # gaze_at_camera_ratio_T : 所有有人脸帧中，|gaze_x| < gaze_threshold_h
+    #                           且 solvePnP 成功 且 |yaw| < T 的比例
+    gaze_ok = np.abs(gaze_x_arr) < gaze_threshold_h   # 仅看水平眼球偏移
+    for t in YAW_THRESHOLDS:
+        head_ok = valid_mask & (np.abs(yaw_arr) < t)
+        if valid_mask.any():
+            result[f"head_frontal_ratio_{t}"]   = float(np.mean(np.abs(yaw_arr[valid_mask]) < t))
+        result[f"gaze_at_camera_ratio_{t}"] = float(np.mean(gaze_ok & head_ok))
 
     return result
 
@@ -394,13 +410,15 @@ def extract_gaze_features(
     内部调用 visual_fer.read_sampled_frames() + extract_gaze_from_frames()。
     """
     nan = float("nan")
+    multi = {f"head_frontal_ratio_{t}": nan for t in YAW_THRESHOLDS}
+    multi.update({f"gaze_at_camera_ratio_{t}": nan for t in YAW_THRESHOLDS})
     empty = dict(
         file_stem=video_path.stem,
-        gaze_at_camera_ratio=nan, gaze_x_mean=nan, gaze_x_std=nan,
+        gaze_x_mean=nan, gaze_x_std=nan,
         gaze_y_mean=nan, gaze_y_std=nan,
         head_yaw_mean=nan, head_yaw_std=nan,
         head_pitch_mean=nan, head_pitch_std=nan,
-        head_frontal_ratio=nan, combined_attn_ratio=nan,
+        **multi,
         frames_analyzed=0, frames_with_face=0,
         method="unavailable", error="",
     )
