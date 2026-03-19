@@ -11,7 +11,6 @@ analyze/run_gaze.py
   - 断点续算
 
 运行（SJTU HPC）：
-  # 修改下方 INDEXED_VIDEO_DIR 为 HPC 上的视频路径，然后：
   python run_gaze.py
 
 预期耗时（64 核，2474 个视频，~67s/视频）：
@@ -29,13 +28,12 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import OUTPUT_DIR, VISUAL_SAMPLE_FPS, FRAME_MAX_LONG_SIDE
+from config import OUTPUT_DIR, VISUAL_SAMPLE_FPS, FRAME_MAX_LONG_SIDE, INDEX_VIDEO_DIR
 from visual_fer  import read_sampled_frames
 from visual_gaze import extract_gaze_from_frames, YAW_THRESHOLDS
 
 # ─── 路径 & 参数 ──────────────────────────────────────────────────────
-# !! 修改为 HPC 上的实际视频路径 !!
-INDEXED_VIDEO_DIR = Path("/path/to/路演视频")
+INDEXED_VIDEO_DIR = INDEX_VIDEO_DIR
 GAZE_OUTPUT_FILE  = OUTPUT_DIR / "visual_gaze.csv"
 
 N_READERS      = 4                                       # 并行视频解码线程

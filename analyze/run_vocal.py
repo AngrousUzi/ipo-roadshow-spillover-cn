@@ -4,7 +4,14 @@ analyze/run_vocal.py
 批量提取所有路演音频的声学特征（Vocal Component）。
 
 输出：analyze/output/vocal_features.csv
-      列：file_stem, f0_mean, f0_std, rms_mean, rms_std, speech_rate, duration_s, error
+      列：
+        file_stem, duration_s,
+        f0_mean, f0_std, f0_range, f0_slope, voiced_fraction,
+        rms_mean, rms_std, rms_cv, rms_dynamic_range, rms_snr_proxy,
+        speech_rate, articulation_rate,
+        pause_rate, mean_pause_duration, n_pauses_per_min,
+        asr_logprob_mean,
+        error
 
 断点续算：若输出文件已存在，跳过已处理的 file_stem。
 
@@ -23,7 +30,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
-    PLATFORM_LIST, OUTPUT_DIR,
+    PLATFORM_LIST, OUTPUT_DIR, INDEX_AUDIO_DIR,
     get_audio_dir, find_trans_for_audio,
     AUDIO_SR, HOP_LENGTH, FMIN, FMAX,
 )
@@ -31,7 +38,7 @@ from vocal_features import extract_vocal_features
 
 OUTPUT_FILE      = OUTPUT_DIR / "vocal_features.csv"
 PARALLEL_PROCS   = int(os.getenv("SLURM_CPUS_PER_TASK", "4"))
-INDEXED_AUDIO_DIR = OUTPUT_DIR / ".." / "路演音频"
+INDEXED_AUDIO_DIR = INDEX_AUDIO_DIR
 
 # ─── Worker ────────────────────────────────────────────────────────────
 

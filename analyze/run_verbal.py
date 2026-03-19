@@ -22,13 +22,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     PLATFORM_LIST, OUTPUT_DIR, LEXICON_DIR,
-    get_trans_dir,
+    get_trans_dir, get_index_trans_dir,
 )
 from verbal_sentiment import analyze_verbal_sentiment
 
 OUTPUT_FILE    = OUTPUT_DIR / "verbal_sentiment.csv"
 PARALLEL_PROCS = int(os.getenv("SLURM_CPUS_PER_TASK", "4"))
-INDEX_TRANS_DIR = OUTPUT_DIR / ".." / "路演转录"
 
 def _worker(json_path_str: str) -> dict:
     json_path = Path(json_path_str)
@@ -56,7 +55,7 @@ def collect_tasks(done_stems: set) -> list[str]:
 def collect_index_tasks() -> list[str]:
     """收集所有待处理的 index 转录文件路径（字符串），跳过已完成的。"""
     tasks = []
-    trans_dir = INDEX_TRANS_DIR
+    trans_dir = get_index_trans_dir()
     if not trans_dir.exists():
         print(f"[SKIP] 目录不存在: {trans_dir}")
     if trans_dir.exists():

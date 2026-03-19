@@ -24,9 +24,14 @@ else:               # HPC / Linux
 PLATFORM_LIST = ["全景", "上证", "中国证券网", "中证", "IR"]
 
 # ─── 子目录名后缀 ─────────────────────────────────────────────────────
-VIDEO_SUFFIX = "路演视频"    # e.g. 全景路演视频/
-AUDIO_SUFFIX = "路演音频"    # e.g. 全景路演音频/
-TRANS_SUFFIX = "路演转录"    # e.g. 全景路演转录/
+VIDEO_SUFFIX = "路演视频"               # e.g. 全景路演视频/
+AUDIO_SUFFIX = "路演音频"               # e.g. 全景路演音频/
+TRANS_SUFFIX = "路演转录_去幻觉"         # e.g. 全景路演转录_去幻觉/
+
+# 平台聚合目录（无平台前缀）
+INDEX_VIDEO_DIR = DATA_ROOT / VIDEO_SUFFIX
+INDEX_AUDIO_DIR = DATA_ROOT / AUDIO_SUFFIX
+INDEX_TRANS_DIR = DATA_ROOT / TRANS_SUFFIX
 
 # ─── 输出目录 ────────────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -34,11 +39,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── 分析参数 ────────────────────────────────────────────────────────
 # 视觉分析：每秒采样帧数（越高越精确，越慢）
-VISUAL_SAMPLE_FPS = 1.0
+VISUAL_SAMPLE_FPS = 12
 
 # GPU 批推理配置（visual_fer.py GPU 模式）
 GPU_DEVICE     = "cuda"   # "cuda" 或 "cpu"；代码内自动检测是否有 CUDA
-GPU_BATCH_SIZE = 32       # 每批送入 GPU 的帧数（显存 8GB 建议 32，16GB 可用 64）
+GPU_BATCH_SIZE = 512       # 每批送入 GPU 的帧数（显存 8GB 建议 32，16GB 可用 64）
 # 采样帧缓冲时的长边分辨率上限（缩小以节省内存；人脸检测不需要全分辨率）
 FRAME_MAX_LONG_SIDE = 720
 
@@ -66,7 +71,7 @@ def get_video_dir(platform: str) -> Path:
 
 
 def get_trans_dir(platform: str) -> Path:
-    """返回指定平台的转录目录路径。"""
+    """返回指定平台的转录目录路径（仅去幻觉目录）。"""
     return DATA_ROOT / f"{platform}{TRANS_SUFFIX}"
 
 
@@ -100,8 +105,20 @@ def find_trans_for_audio(audio_path: Path) -> Path | None:
     遍历所有平台的转录目录寻找同名（.json）文件。
     """
     stem = audio_path.stem
+
+    # 先查平台聚合目录（仅去幻觉目录）
+    candidate = INDEX_TRANS_DIR / f"{stem}.json"
+    if candidate.exists():
+        return candidate
+
+    # 再查各平台目录（仅去幻觉目录）
     for platform in PLATFORM_LIST:
-        candidate = get_trans_dir(platform) / f"{stem}.json"
-        if candidate.exists():
-            return candidate
+        preferred = DATA_ROOT / f"{platform}{TRANS_SUFFIX}" / f"{stem}.json"
+        if preferred.exists():
+            return preferred
     return None
+
+
+def get_index_trans_dir() -> Path:
+    """返回平台聚合转录目录（仅去幻觉目录）。"""
+    return INDEX_TRANS_DIR

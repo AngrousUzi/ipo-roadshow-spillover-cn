@@ -24,11 +24,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import OUTPUT_DIR, VISUAL_SAMPLE_FPS, GPU_DEVICE, FRAME_MAX_LONG_SIDE
+from config import OUTPUT_DIR, VISUAL_SAMPLE_FPS, GPU_DEVICE, FRAME_MAX_LONG_SIDE, INDEX_VIDEO_DIR
 from visual_fer import read_sampled_frames, extract_visual_emotions_from_frames
 
 # ─── 路径 & 参数 ──────────────────────────────────────────────────────
-INDEXED_VIDEO_DIR = Path("/cloud/cloud-ssd1/路演视频")
+INDEXED_VIDEO_DIR = INDEX_VIDEO_DIR
 FER_OUTPUT_FILE   = OUTPUT_DIR / "visual_fer.csv"
 
 GPU_BATCH_SIZE  = 256   # A800 80GB
