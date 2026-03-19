@@ -4,7 +4,7 @@ analyze/run_fer.py
 批量提取面部情绪（FER）→ output/visual_fer.csv
 
 专为 A800 单卡优化：
-  - GPU_BATCH_SIZE=256，充分利用 80GB 显存
+    - GPU_BATCH_SIZE 来自 config.py（当前统一为 1024）
   - N_READERS 个线程并行解码视频，掩盖 I/O 延迟
   - 主线程 FER 串行，无显存争抢
   - 断点续算
@@ -24,15 +24,17 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import OUTPUT_DIR, VISUAL_SAMPLE_FPS, GPU_DEVICE, FRAME_MAX_LONG_SIDE, INDEX_VIDEO_DIR
+from config import (
+    OUTPUT_DIR, VISUAL_SAMPLE_FPS, GPU_DEVICE,
+    FRAME_MAX_LONG_SIDE, INDEX_VIDEO_DIR, GPU_BATCH_SIZE,
+)
 from visual_fer import read_sampled_frames, extract_visual_emotions_from_frames
 
 # ─── 路径 & 参数 ──────────────────────────────────────────────────────
 INDEXED_VIDEO_DIR = INDEX_VIDEO_DIR
 FER_OUTPUT_FILE   = OUTPUT_DIR / "visual_fer.csv"
 
-GPU_BATCH_SIZE  = 256   # A800 80GB
-N_READERS       = 2     # 并行视频解码线程
+N_READERS       = 6     # 并行视频解码线程
 PREFETCH_Q_SIZE = N_READERS * 4
 
 

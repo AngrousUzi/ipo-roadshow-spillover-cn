@@ -148,14 +148,13 @@ class _FERGpuEngine:
             self.fer_model.classifier_bias, dtype=_torch.float32
         ).to(dev)   # [8]
 
-        # 情绪分类的预处理（224×224，ImageNet 归一化）
-        self._preprocess = _transforms.Compose([
-            _transforms.ToPILImage(),
-            _transforms.Resize((224, 224)),
-            _transforms.ToTensor(),
-            _transforms.Normalize([0.485, 0.456, 0.406],
-                                   [0.229, 0.224, 0.225]),
-        ])
+        # 归一化均值/标准差（常驻 GPU，避免每 batch 重建）
+        self._mean = _torch.tensor(
+            [0.485, 0.456, 0.406], dtype=_torch.float32, device=dev
+        ).view(1, 3, 1, 1)
+        self._std = _torch.tensor(
+            [0.229, 0.224, 0.225], dtype=_torch.float32, device=dev
+        ).view(1, 3, 1, 1)
 
     # ── 阶段 1：批量人脸检测 ─────────────────────────────────────────
 
@@ -198,26 +197,32 @@ class _FERGpuEngine:
         将所有非 None 的裁剪图打包成一个 Tensor，一次 GPU forward pass 完成。
         返回各裁剪图对应的情绪概率字典（归一化到 [0,1]）或 None。
         """
-        valid_indices = [i for i, c in enumerate(crops) if c is not None]
         results: list[dict[str, float] | None] = [None] * len(crops)
 
-        if not valid_indices:
-            return results
-
-        # 构建 Tensor batch（全部在同一次 GPU forward 中处理）
-        tensors = []
-        for i in valid_indices:
-            face_rgb = _cv2.cvtColor(crops[i], _cv2.COLOR_BGR2RGB)
+        tensors: list = []
+        valid_out: list[int] = []
+        for i, crop in enumerate(crops):
+            if crop is None:
+                continue
             try:
-                t = self._preprocess(face_rgb)
-                tensors.append(t)
+                face_rgb = _cv2.cvtColor(crop, _cv2.COLOR_BGR2RGB)
+                # cv2 resize（比 PIL 快 3-5×）；结果已是 (224,224,3) contiguous
+                face_224 = _cv2.resize(face_rgb, (224, 224),
+                                       interpolation=_cv2.INTER_LINEAR)
+                tensors.append(_torch.from_numpy(face_224.copy()).permute(2, 0, 1))
+                valid_out.append(i)
             except Exception:
-                valid_indices = [j for j in valid_indices if j != i]
+                pass
 
         if not tensors:
             return results
 
-        batch_t = _torch.stack(tensors).to(self.device)
+        # H2D 一次性传输 + GPU 归一化（fused）
+        batch_t = (_torch.stack(tensors)
+                   .to(self.device, dtype=_torch.float32)
+                   .div_(255.0)
+                   .sub_(self._mean)
+                   .div_(self._std))
 
         with _torch.no_grad():
             # fer_model.model 的 classifier 被替换为 Identity，输出 1280-dim 特征。
@@ -226,7 +231,7 @@ class _FERGpuEngine:
             logits   = features @ self._cls_weight.T + self._cls_bias   # [N, 8]
             probs    = _torch.softmax(logits, dim=1).cpu().numpy()
 
-        for k, idx in enumerate(valid_indices):
+        for k, idx in enumerate(valid_out):
             prob_dict = {}
             for cls, p in zip(self.classes, probs[k].tolist()):
                 norm_cls = _HSE_ALIAS.get(cls, cls.lower())
