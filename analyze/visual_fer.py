@@ -165,10 +165,8 @@ class _FERGpuEngine:
         对一批 BGR 帧做 MTCNN 人脸检测，返回各帧对应的人脸裁剪图（BGR）或 None。
         MTCNN.detect() 接受 PIL 列表，内部在 GPU 上并行处理整个 batch。
         """
-        pil_imgs = [
-            _PILImage.fromarray(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
-            for f in frames_bgr
-        ]
+        # f[:,:,::-1] 是 BGR→RGB 的 numpy view（无拷贝），PIL.fromarray 再拷贝一次
+        pil_imgs = [_PILImage.fromarray(f[:, :, ::-1]) for f in frames_bgr]
         try:
             boxes_list, probs_list = self.mtcnn.detect(pil_imgs)
         except Exception:
@@ -205,11 +203,10 @@ class _FERGpuEngine:
             if crop is None:
                 continue
             try:
-                face_rgb = _cv2.cvtColor(crop, _cv2.COLOR_BGR2RGB)
-                # cv2 resize（比 PIL 快 3-5×）；结果已是 (224,224,3) contiguous
-                face_224 = _cv2.resize(face_rgb, (224, 224),
+                # resize 在 BGR 图上做（省去 cvtColor），再 slice 翻转通道+copy
+                face_224 = _cv2.resize(crop, (224, 224),
                                        interpolation=_cv2.INTER_LINEAR)
-                tensors.append(_torch.from_numpy(face_224.copy()).permute(2, 0, 1))
+                tensors.append(_torch.from_numpy(face_224[:, :, ::-1].copy()).permute(2, 0, 1))
                 valid_out.append(i)
             except Exception:
                 pass
@@ -285,6 +282,58 @@ def _get_gpu_engine(device: str = "cuda", batch_size: int = 32) -> Optional[_FER
 
 # ─── 帧读取工具 ───────────────────────────────────────────────────────
 
+def iter_frame_chunks(
+    video_path: Path,
+    sample_fps: float = 1.0,
+    max_long_side: int = 720,
+    chunk_size: int = 1024,
+):
+    """
+    生成器：将视频按 chunk_size 帧分块 yield，供流式 GPU 推理使用。
+    yield (chunk: list[np.ndarray], is_last: bool)
+
+    核心优化：对不采样的帧调用 cap.grab()（只移动指针，不解码），
+    比 cap.read() 快约 2-5×，显著降低 CPU 解码压力。
+    """
+    import cv2
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise IOError(f"无法打开视频: {video_path}")
+    try:
+        video_fps = cap.get(cv2.CAP_PROP_FPS)
+        if video_fps <= 0:
+            video_fps = 25.0
+        interval = max(1, int(round(video_fps / sample_fps)))
+
+        chunk: list[np.ndarray] = []
+        frame_idx = 0
+        while True:
+            if frame_idx % interval == 0:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if max_long_side > 0:
+                    h, w = frame.shape[:2]
+                    if max(h, w) > max_long_side:
+                        scale = max_long_side / max(h, w)
+                        frame = cv2.resize(
+                            frame,
+                            (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                chunk.append(frame)
+                if len(chunk) >= chunk_size:
+                    yield chunk, False
+                    chunk = []
+            else:
+                if not cap.grab():   # 跳过帧：不解码，只移动指针
+                    break
+            frame_idx += 1
+        yield chunk, True            # 最后一块（可能为空列表）
+    finally:
+        cap.release()
+
+
 def read_sampled_frames(
     video_path: Path,
     sample_fps: float = 1.0,
@@ -292,46 +341,13 @@ def read_sampled_frames(
 ) -> tuple[list[np.ndarray], float]:
     """
     从视频文件读取所有采样帧，返回 (frames, video_fps)。
-
-    frames 是 BGR numpy 数组列表，长边缩放到 max_long_side 以节省内存。
-    max_long_side=0 表示保持原始分辨率。
-
-    动机：FER 和 Gaze 共享同一帧列表，视频只读一遍。
+    内部使用 iter_frame_chunks，通过 cap.grab() 跳过不采样帧。
     """
-    import cv2
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise IOError(f"无法打开视频: {video_path}")
-
-    try:
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        if video_fps <= 0:
-            video_fps = 25.0
-        frame_interval = max(1, int(round(video_fps / sample_fps)))
-
-        frames: list[np.ndarray] = []
-        frame_idx = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx % frame_interval == 0:
-                if max_long_side > 0:
-                    h, w = frame.shape[:2]
-                    long = max(h, w)
-                    if long > max_long_side:
-                        scale = max_long_side / long
-                        frame = cv2.resize(
-                            frame,
-                            (int(w * scale), int(h * scale)),
-                            interpolation=cv2.INTER_AREA,
-                        )
-                frames.append(frame)
-            frame_idx += 1
-    finally:
-        cap.release()
-
-    return frames, video_fps
+    frames: list[np.ndarray] = []
+    for chunk, _ in iter_frame_chunks(video_path, sample_fps, max_long_side,
+                                      chunk_size=100_000):
+        frames.extend(chunk)
+    return frames, 0.0   # video_fps 调用方均以 _ 丢弃，返回 0.0 兼容
 
 
 # ─── 情绪统计聚合 ─────────────────────────────────────────────────────
@@ -340,7 +356,7 @@ def read_sampled_frames(
 _EMO8_KEYS = ("angry", "contempt", "disgust", "fear", "happy", "neutral", "sad", "surprise")
 
 
-def _aggregate_emotion_results(
+def aggregate_emotion_results(
     emo_list: list[dict[str, float] | None],
     stem: str,
     method: str,
@@ -435,7 +451,7 @@ def extract_visual_emotions_from_frames(
     engine = _get_gpu_engine(device=device, batch_size=batch_size)
     if engine is not None:
         emo_list = engine.analyze_frames(frames)
-        return _aggregate_emotion_results(emo_list, stem, method="gpu_batch")
+        return aggregate_emotion_results(emo_list, stem, method="gpu_batch")
 
     # GPU 不可用时返回错误结果（而非 None）
     return dict(
