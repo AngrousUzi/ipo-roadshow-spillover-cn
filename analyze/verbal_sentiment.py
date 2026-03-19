@@ -228,7 +228,7 @@ def analyze_verbal_sentiment(
     return result
 
 if __name__ == "__main__":
-    json_path = Path("sample_transcript.json")  # 替换为实际 JSON 路径
+    json_path = Path("IR路演转录/003030_祖名股份_2020-12-22.json")  # 替换为实际 JSON 路径
     start_time=time.time()
     res = analyze_verbal_sentiment(json_path)
     end_time=time.time()
