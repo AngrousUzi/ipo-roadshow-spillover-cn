@@ -4,8 +4,11 @@ analyze/run_verbal.py
 批量处理所有路演转录 JSON，计算文本情绪指标（Verbal Component）。
 
 输出：analyze/output/verbal_sentiment.csv
-      列：file_stem, positive_ratio, negative_ratio, uncertain_ratio,
-          tone_score, total_words, total_chars, method, error
+      列：file_stem,
+          ann_positive_ratio, ann_negative_ratio, ann_tone_score,
+          social_positive_ratio, social_negative_ratio, social_tone_score,
+          competition_ratio, prospect_ratio, policy_pos_ratio, policy_neg_ratio,
+          total_words, total_chars, method, error
 
 断点续算：跳过已处理的 file_stem。
 并行：多进程（SLURM_CPUS_PER_TASK，默认 4）。
