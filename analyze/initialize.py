@@ -6,6 +6,7 @@ import ffmpeg
 import pandas as pd
 import sys
 import re
+import json
 import tempfile
 import multiprocessing
 import os
@@ -61,6 +62,139 @@ def check_video_integrity(video_path: Path) -> str:
         msg = f"完整性检查异常: {e}"
         print(f"[WARN] {msg}")
         return msg
+
+
+def check_video_quality(video_path: Path) -> dict:
+    """
+    使用 ffprobe 获取视频质量指标，并用 ffmpeg 全解码检测帧级别错误。
+
+    返回字段：
+        index2009, filename,
+        codec_video, width, height, fps,
+        video_bitrate_kbps, duration_sec, container_duration_sec,
+        has_audio, audio_codec,
+        integrity_error    (来自 -c copy 的 stderr)
+        decode_error_count (全解码错误行数)
+        decode_error_sample(前 3 条错误)
+        quality_flags      (问题摘要，分号分隔)
+    """
+    stem = video_path.stem
+    index2009 = stem.split("_")[0] if "_" in stem else stem
+
+    record: dict = {
+        "index2009":             index2009,
+        "filename":              video_path.name,
+        "codec_video":           "",
+        "width":                 None,
+        "height":                None,
+        "fps":                   None,
+        "video_bitrate_kbps":    None,
+        "duration_sec":          None,
+        "container_duration_sec": None,
+        "has_audio":             False,
+        "audio_codec":           "",
+        "integrity_error":       "",
+        "decode_error_count":    0,
+        "decode_error_sample":   "",
+        "quality_flags":         "",
+        "gaze_flags":            "",
+    }
+
+    # ── 1. ffprobe 获取元数据 ────────────────────────────────────────────
+    try:
+        probe_result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams", "-show_format",
+                str(video_path),
+            ],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore",
+        )
+        probe = json.loads(probe_result.stdout)
+    except Exception as e:
+        record["quality_flags"] = f"ffprobe失败: {e}"
+        return record
+
+    fmt = probe.get("format", {})
+    container_dur = fmt.get("duration")
+    record["container_duration_sec"] = round(float(container_dur), 2) if container_dur else None
+
+    for stream in probe.get("streams", []):
+        ctype = stream.get("codec_type", "")
+        if ctype == "video" and not record["codec_video"]:
+            record["codec_video"] = stream.get("codec_name", "")
+            record["width"]       = stream.get("width")
+            record["height"]      = stream.get("height")
+            # fps
+            r_fps = stream.get("r_frame_rate", "0/1")
+            try:
+                num, den = r_fps.split("/")
+                record["fps"] = round(int(num) / int(den), 2) if int(den) else None
+            except Exception:
+                record["fps"] = None
+            # bitrate：优先取 stream，回退到 format
+            br = stream.get("bit_rate") or fmt.get("bit_rate")
+            record["video_bitrate_kbps"] = round(int(br) / 1000, 1) if br else None
+            # duration：优先取 stream，回退到 format
+            dur = stream.get("duration") or fmt.get("duration")
+            record["duration_sec"] = round(float(dur), 2) if dur else None
+        elif ctype == "audio" and not record["has_audio"]:
+            record["has_audio"]   = True
+            record["audio_codec"] = stream.get("codec_name", "")
+
+    # ── 2. 容器完整性检查（-c copy，不解码） ────────────────────────────
+    record["integrity_error"] = check_video_integrity(video_path)
+
+    # ── 3. 全解码检查（检测花屏、帧损坏等） ─────────────────────────────
+    try:
+        dec = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "null", "-"],
+            capture_output=True, text=True, encoding="utf-8", errors="ignore",
+        )
+        err_lines = [l for l in dec.stderr.splitlines() if l.strip()]
+        record["decode_error_count"]  = len(err_lines)
+        record["decode_error_sample"] = " | ".join(err_lines[:3])
+    except Exception as e:
+        record["decode_error_count"]  = -1
+        record["decode_error_sample"] = str(e)
+
+    # ── 4. 汇总质量标志 ──────────────────────────────────────────────────
+    flags: list[str] = []
+    br = record["video_bitrate_kbps"]
+    if br is not None and br < 100:
+        flags.append(f"码率极低({br}kbps)")
+    dur = record["duration_sec"]
+    if dur is not None and dur < 60:
+        flags.append(f"时长过短({dur}s)")
+    w, h = record["width"], record["height"]
+    if w and h and w * h < 960 * 540:
+        flags.append(f"分辨率低于540p({w}x{h})")
+    if not record["has_audio"]:
+        flags.append("无音频流")
+    if record["decode_error_count"] > 0:
+        flags.append(f"解码错误({record['decode_error_count']}行)")
+    if record["integrity_error"]:
+        flags.append("容器完整性异常")
+    cdr = record["container_duration_sec"]
+    if dur and cdr and abs(dur - cdr) > 2:
+        flags.append(f"时长不一致(差{abs(dur - cdr):.1f}s)")
+    record["quality_flags"] = "; ".join(flags)
+
+    # ── 5. Gaze 分析参数建议 ─────────────────────────────────────────────
+    # 基于 visual_gaze.py 参数：VISUAL_SAMPLE_FPS=12, FRAME_MAX_LONG_SIDE=720
+    gaze_notes: list[str] = []
+    if record["fps"] is not None and record["fps"] < 12:
+        gaze_notes.append(f"帧率{record['fps']}fps低于VISUAL_SAMPLE_FPS=12，建议降低采样帧率")
+    if record["height"] is not None and record["height"] < 480:
+        gaze_notes.append(f"分辨率{record['width']}x{record['height']}偏低，人脸像素可能不足")
+    br = record["video_bitrate_kbps"]
+    if br is not None and br < 500 and (record["height"] or 0) >= 720:
+        gaze_notes.append(f"720p+视频码率仅{br}kbps，压缩伪影可能影响虹膜关键点定位")
+    record["gaze_flags"] = "; ".join(gaze_notes)
+
+    return record
+
 
 
 def collect_audio_tasks() -> list[tuple[str, Path | None]]:
@@ -293,9 +427,10 @@ def concat_videos_reencode(
 
 # ── Multiprocessing worker ─────────────────────────────────────────────────────
 
-def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
+def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]:
     """
-    处理单行路演数据，返回 (index2009, video_path_str | None, success, error_str)。
+    处理单行路演数据，返回 (index2009, video_path_str | None, success, error_str, quality)。
+    quality 为 check_video_quality() 的完整结果字典；处理失败时为空字典。
     作为 multiprocessing.Pool worker 使用（须为 module-level 函数）。
     """
     platform     = row_data["platform"]
@@ -308,14 +443,14 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
 
     if not video_dir.exists():
         print(f"[WARN] 视频目录不存在: {video_dir}")
-        return index2009, None, False, "视频目录不存在"
+        return index2009, None, False, "视频目录不存在", {}
 
     # ── 上证 / 中国证券网：取视频1、2拼接 ──────────────────────────────────
     if platform in ("上证", "中国证券网"):
         if output_path.exists():
-            err = check_video_integrity(output_path)
-            if err == "":
-                return index2009, str(output_path), True, err
+            quality = check_video_quality(output_path)
+            if quality["integrity_error"] == "":
+                return index2009, str(output_path), True, quality["integrity_error"], quality
             print(f"[WARN] 视频完整性检查报错: {output_path}")
             try:
                 output_path.unlink()
@@ -341,32 +476,33 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
         if not video_paths:
             msg = f"未找到任何视频段: index={index2009} code={code} date={date}"
             print(f"[ERROR] {msg}")
-            return index2009, None, False, msg
+            return index2009, None, False, msg, {}
 
         success, error_str = concat_videos_with_retry(video_paths, output_path)
         if success:
-            integrity_err = check_video_integrity(output_path)
-            if not integrity_err:
-                return index2009, str(output_path), True, error_str
+            quality = check_video_quality(output_path)
+            if not quality["integrity_error"]:
+                return index2009, str(output_path), True, error_str, quality
             print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
             try:
                 output_path.unlink()
             except OSError:
                 pass
-            error_str = integrity_err
+            error_str = quality["integrity_error"]
         else:
             print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
         success, error_str = concat_videos_reencode(video_paths, output_path)
         if success:
-            return index2009, str(output_path), True, error_str
-        return index2009, None, False, error_str
+            quality = check_video_quality(output_path)
+            return index2009, str(output_path), True, error_str, quality
+        return index2009, None, False, error_str, {}
 
     # ── 中证（多段）──────────────────────────────────────────────────────────
     elif platform == "中证" and video_number > 1:
         if output_path.exists():
-            err = check_video_integrity(output_path)
-            if err == "":
-                return index2009, str(output_path), True, err
+            quality = check_video_quality(output_path)
+            if quality["integrity_error"] == "":
+                return index2009, str(output_path), True, quality["integrity_error"], quality
             print(f"[WARN] 视频完整性检查报错: {output_path}")
             try:
                 output_path.unlink()
@@ -403,25 +539,26 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
         if not video_paths:
             msg = f"未找到任何视频段: index={index2009} code={code} date={date}"
             print(f"[ERROR] {msg}")
-            return index2009, None, False, msg
+            return index2009, None, False, msg, {}
 
         success, error_str = concat_videos_with_retry(video_paths, output_path)
         if success:
-            integrity_err = check_video_integrity(output_path)
-            if not integrity_err:
-                return index2009, str(output_path), True, error_str
+            quality = check_video_quality(output_path)
+            if not quality["integrity_error"]:
+                return index2009, str(output_path), True, error_str, quality
             print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
             try:
                 output_path.unlink()
             except OSError:
                 pass
-            error_str = integrity_err
+            error_str = quality["integrity_error"]
         else:
             print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
         success, error_str = concat_videos_reencode(video_paths, output_path)
         if success:
-            return index2009, str(output_path), True, error_str
-        return index2009, None, False, error_str
+            quality = check_video_quality(output_path)
+            return index2009, str(output_path), True, error_str, quality
+        return index2009, None, False, error_str, {}
 
     # ── 直接使用：中证（单段）/ 全景 / IR ────────────────────────────────────
     else:
@@ -432,7 +569,7 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
         if not candidates:
             msg = f"未找到视频: index={index2009} code={code} date={date} @ {platform}"
             print(f"[ERROR] {msg}")
-            return index2009, None, False, msg
+            return index2009, None, False, msg, {}
 
         if len(candidates) > 1:
             print(
@@ -441,13 +578,15 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str]:
             )
 
         final_path, error_str = clip_video(candidates[0], output_path)
-        return index2009, str(final_path), True, error_str
+        quality = check_video_quality(final_path)
+        return index2009, str(final_path), True, error_str, quality
 
 
-def collect_video_tasks() -> list[tuple[str, Path | None, bool, str]]:
+def collect_video_tasks() -> list[tuple[str, Path | None, bool, str, dict]]:
     """
     根据路演信息表，为每场路演生成最终处理用视频路径队列（每场路演 1 个视频）。
-    使用多进程并行处理拼接/复制操作。
+    使用多进程并行处理拼接/复制操作，同时收集视频质量指标。
+    结果写入 PROJECT_ROOT/ipo_index_video_preprocess.xlsx。
 
     拼接规则（只保留路演回放，自动排除宣传片等非回放内容）：
     - 上证 / 中国证券网：将第1和第2个"_视频N"片段按序号升序拼接为 1 个文件
@@ -458,7 +597,7 @@ def collect_video_tasks() -> list[tuple[str, Path | None, bool, str]]:
 
     Returns
     -------
-    list of (index2009, video_path | None, success, error_str)
+    list of (index2009, video_path | None, success, error_str, quality: dict)
     """
     df_index = pd.read_excel(INDEX_PATH, dtype=str)
     df_index = df_index[df_index["采用视频平台"].notna()].copy()
@@ -487,35 +626,38 @@ def collect_video_tasks() -> list[tuple[str, Path | None, bool, str]]:
     with multiprocessing.Pool(processes=num_workers) as pool:
         raw_results = pool.map(process_video_row, row_data_list)
 
-    results: list[tuple[str, Path | None, bool, str]] = [
-        (idx, Path(vp) if vp is not None else None, ok, err)
-        for idx, vp, ok, err in raw_results
+    results: list[tuple[str, Path | None, bool, str, dict]] = [
+        (idx, Path(vp) if vp is not None else None, ok, err, quality)
+        for idx, vp, ok, err, quality in raw_results
     ]
 
-    valid_count = sum(1 for _, p, _, _ in results if p is not None)
+    valid_count = sum(1 for _, p, *_ in results if p is not None)
     print(f"共生成 {valid_count} 个路演视频路径（总计 {len(results)} 场路演）。")
+
+    # 写入视频预处理质量报告
+    quality_rows = []
+    for idx, vp, ok, err, quality in results:
+        row = {
+            "index2009":     idx,
+            "video_path":    str(vp) if vp is not None else "",
+            "success":       ok,
+            "ffmpeg_errors": err,
+        }
+        row.update(quality)
+        quality_rows.append(row)
+    df_quality = pd.DataFrame(quality_rows)
+    xlsx_path = PROJECT_ROOT / "ipo_index_video_preprocess.xlsx"
+    df_quality.to_excel(xlsx_path, index=False)
+    print(f"视频预处理质量报告已保存: {xlsx_path}")
+
     return results
 
 
 if __name__ == "__main__":
     video_tasks = collect_video_tasks()
 
-    # 将视频任务结果保存为 CSV（含转换状态与报错信息）
-    df_video = pd.DataFrame([
-        {
-            "index2009":     idx,
-            "video_path":    str(vp) if vp is not None else "",
-            "success":       ok,
-            "ffmpeg_errors": err,
-        }
-        for idx, vp, ok, err in video_tasks
-    ])
-    video_csv = PROJECT_ROOT / "video_tasks.csv"
-    df_video.to_csv(video_csv, encoding="utf-8-sig", index=False)
-    print(f"视频任务日志已保存: {video_csv}")
-
     # 将 video 序列提取音频
-    for idx, vp, ok, _ in video_tasks:
+    for idx, vp, ok, *_ in video_tasks:
         if vp is not None:
             output_audio_path = AUDIO_OUTPUT_DIR / (vp.stem + ".wav")
             if not output_audio_path.exists():
