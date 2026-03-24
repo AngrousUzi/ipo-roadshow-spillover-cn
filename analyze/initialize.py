@@ -22,6 +22,7 @@ AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TRANS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PARALLEL_PROCESSES = int(os.getenv("SLURM_CPUS_PER_TASK", "16"))
+FFMPEG_THREADS = max(1, PARALLEL_PROCESSES // max(1, PARALLEL_PROCESSES))
 
 if os.name == "nt":  # Windows
     VIDEO_OPERATRION_PATH = PROJECT_ROOT / "videos"
@@ -64,7 +65,7 @@ def check_video_integrity(video_path: Path) -> str:
         return msg
 
 
-def check_video_quality(video_path: Path) -> dict:
+def check_video_quality(video_path: Path, full_decode: bool = True) -> dict:
     """
     使用 ffprobe 获取视频质量指标，并用 ffmpeg 全解码检测帧级别错误。
 
@@ -147,17 +148,18 @@ def check_video_quality(video_path: Path) -> dict:
     record["integrity_error"] = check_video_integrity(video_path)
 
     # ── 3. 全解码检查（检测花屏、帧损坏等） ─────────────────────────────
-    try:
-        dec = subprocess.run(
-            ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "null", "-"],
-            capture_output=True, text=True, encoding="utf-8", errors="ignore",
-        )
-        err_lines = [l for l in dec.stderr.splitlines() if l.strip()]
-        record["decode_error_count"]  = len(err_lines)
-        record["decode_error_sample"] = " | ".join(err_lines[:3])
-    except Exception as e:
-        record["decode_error_count"]  = -1
-        record["decode_error_sample"] = str(e)
+    if full_decode:
+        try:
+            dec = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(video_path), "-f", "null", "-"],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+            )
+            err_lines = [l for l in dec.stderr.splitlines() if l.strip()]
+            record["decode_error_count"]  = len(err_lines)
+            record["decode_error_sample"] = " | ".join(err_lines[:3])
+        except Exception as e:
+            record["decode_error_count"]  = -1
+            record["decode_error_sample"] = str(e)
 
     # ── 4. 汇总质量标志 ──────────────────────────────────────────────────
     flags: list[str] = []
@@ -172,7 +174,7 @@ def check_video_quality(video_path: Path) -> dict:
         flags.append(f"分辨率低于540p({w}x{h})")
     if not record["has_audio"]:
         flags.append("无音频流")
-    if record["decode_error_count"] > 0:
+    if full_decode and record["decode_error_count"] > 0:
         flags.append(f"解码错误({record['decode_error_count']}行)")
     if record["integrity_error"]:
         flags.append("容器完整性异常")
@@ -355,6 +357,7 @@ def concat_videos_reencode(
     audio_bitrate: str = "192k",
     target_resolution: str = "1920:1080",
     target_fps: int = 30,
+    threads: int | None = None,
 ) -> tuple[bool, str]:
     """
     使用 ffmpeg filter_complex concat 重编码拼接视频。
@@ -400,11 +403,13 @@ def concat_videos_reencode(
         cmd += [
             "-filter_complex", filter_complex,
             "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-crf", str(crf), "-preset", "medium",
+            "-c:v", "libx264", "-crf", str(crf), "-preset", "veryfast",
             "-c:a", "aac", "-b:a", audio_bitrate,
             "-movflags", "+faststart",
-            str(temp_path),
         ]
+        if threads is not None:
+            cmd += ["-threads", str(threads)]
+        cmd.append(str(temp_path))
 
         result = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore"
@@ -440,6 +445,7 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]
     video_number = row_data["video_number"]
     video_dir    = Path(row_data["video_dir"])
     output_path  = Path(row_data["output_path"])
+    full_decode  = row_data.get("full_decode", True)
 
     if not video_dir.exists():
         print(f"[WARN] 视频目录不存在: {video_dir}")
@@ -448,7 +454,7 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]
     # ── 上证 / 中国证券网：取视频1、2拼接 ──────────────────────────────────
     if platform in ("上证", "中国证券网"):
         if output_path.exists():
-            quality = check_video_quality(output_path)
+            quality = check_video_quality(output_path, full_decode=full_decode)
             if quality["integrity_error"] == "":
                 return index2009, str(output_path), True, quality["integrity_error"], quality
             print(f"[WARN] 视频完整性检查报错: {output_path}")
@@ -478,29 +484,16 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]
             print(f"[ERROR] {msg}")
             return index2009, None, False, msg, {}
 
-        success, error_str = concat_videos_with_retry(video_paths, output_path)
+        success, error_str = concat_videos_reencode(video_paths, output_path, threads=FFMPEG_THREADS)
         if success:
-            quality = check_video_quality(output_path)
-            if not quality["integrity_error"]:
-                return index2009, str(output_path), True, error_str, quality
-            print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-            error_str = quality["integrity_error"]
-        else:
-            print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
-        success, error_str = concat_videos_reencode(video_paths, output_path)
-        if success:
-            quality = check_video_quality(output_path)
+            quality = check_video_quality(output_path, full_decode=full_decode)
             return index2009, str(output_path), True, error_str, quality
         return index2009, None, False, error_str, {}
 
     # ── 中证（多段）──────────────────────────────────────────────────────────
     elif platform == "中证" and video_number > 1:
         if output_path.exists():
-            quality = check_video_quality(output_path)
+            quality = check_video_quality(output_path, full_decode=full_decode)
             if quality["integrity_error"] == "":
                 return index2009, str(output_path), True, quality["integrity_error"], quality
             print(f"[WARN] 视频完整性检查报错: {output_path}")
@@ -541,22 +534,9 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]
             print(f"[ERROR] {msg}")
             return index2009, None, False, msg, {}
 
-        success, error_str = concat_videos_with_retry(video_paths, output_path)
+        success, error_str = concat_videos_reencode(video_paths, output_path, threads=FFMPEG_THREADS)
         if success:
-            quality = check_video_quality(output_path)
-            if not quality["integrity_error"]:
-                return index2009, str(output_path), True, error_str, quality
-            print(f"[WARN] copy 拼接完整性异常，改用重编码: {output_path}")
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
-            error_str = quality["integrity_error"]
-        else:
-            print(f"[WARN] 视频 copy 拼接失败，尝试重编码 (crf=18, aac 192k)... ({output_path})")
-        success, error_str = concat_videos_reencode(video_paths, output_path)
-        if success:
-            quality = check_video_quality(output_path)
+            quality = check_video_quality(output_path, full_decode=full_decode)
             return index2009, str(output_path), True, error_str, quality
         return index2009, None, False, error_str, {}
 
@@ -578,11 +558,11 @@ def process_video_row(row_data: dict) -> tuple[str, str | None, bool, str, dict]
             )
 
         final_path, error_str = clip_video(candidates[0], output_path)
-        quality = check_video_quality(final_path)
+        quality = check_video_quality(final_path, full_decode=full_decode)
         return index2009, str(final_path), True, error_str, quality
 
 
-def collect_video_tasks() -> list[tuple[str, Path | None, bool, str, dict]]:
+def collect_video_tasks(full_decode: bool = True) -> list[tuple[str, Path | None, bool, str, dict]]:
     """
     根据路演信息表，为每场路演生成最终处理用视频路径队列（每场路演 1 个视频）。
     使用多进程并行处理拼接/复制操作，同时收集视频质量指标。
@@ -620,6 +600,7 @@ def collect_video_tasks() -> list[tuple[str, Path | None, bool, str, dict]]:
             "video_number": video_number,
             "video_dir":    str(video_dir),
             "output_path":  str(output_path),
+            "full_decode":  full_decode,
         })
 
     num_workers = max(1, PARALLEL_PROCESSES)
