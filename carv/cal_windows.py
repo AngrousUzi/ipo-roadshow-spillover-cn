@@ -1,8 +1,8 @@
 """
-将 car_cav_results.csv（逐 bar AR/AV 序列）切分为多个时间窗口的 CAR/CAV
+将 ar_av_results.csv（逐 bar AR/AV 序列）切分为多个时间窗口的 CAR/CAV
 ==========================================================================
 输入：
-  carv/output/car_cav_results.csv
+  carv/output/ar_av_results.csv
     列：ipo_id, rival_fc, event_date, timestamp,
         ar_est1, ar_est2, ar_est3,
         av_est1, av_est2, av_est3
@@ -33,6 +33,7 @@ import os
 import datetime as dt
 import re
 from pathlib import Path
+import multiprocessing as mp
 
 import pandas as pd
 import numpy as np
@@ -48,7 +49,7 @@ CARV_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = CARV_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-INPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
+INPUT_FILE       = OUTPUT_DIR / "ar_av_results.csv"
 INDEX_PATH       = ANN_DIR / "IPO_index.xlsx"
 OUTPUT_WINDOWS   = OUTPUT_DIR / "car_cav_windows.csv"
 OUTPUT_MEAN      = OUTPUT_DIR / "car_cav_windows_mean.csv"
@@ -58,6 +59,22 @@ N_BARS_1HR   = 12
 T925         = dt.time(9, 25)
 T930         = dt.time(9, 30)
 T1500        = dt.time(15, 0)
+
+CPU_NUM = int(os.getenv("SLURM_CPUS_PER_TASK", mp.cpu_count()))
+
+WINDOWS = [
+    "full_day",
+    "before_start_30min",
+    "before_start_1hr",
+    "after_start_30min",
+    "after_start_1hr",
+    "after_end_30min",
+    "after_end_1hr",
+]
+
+AR_COLS  = ["ar_est1", "ar_est2", "ar_est3"]
+AV_COLS  = ["av_est1", "av_est2", "av_est3"]
+EST_NUMS = [1, 2, 3]
 
 
 # ── 帮助函数 ──────────────────────────────────────────────────────
@@ -94,7 +111,7 @@ def _sum_window(df: pd.DataFrame, mask: "pd.Series | np.ndarray",
                 ar_col: str, av_col: str,
                 exclude_925: bool = False) -> tuple:
     """在指定 bar 掩码上对 AR/AV 列求和，返回 (car, cav)。"""
-    sub = df[mask].copy()
+    sub = df[mask]
     if exclude_925:
         sub = sub[sub["_time"] != T925]
     ar_vals = sub[ar_col].dropna()
@@ -108,19 +125,68 @@ def _parse_value_col(col: str) -> dict:
     """解析列名 car/cav_<window>_<with925|no925>_estN。"""
     m = re.match(r"^(car|cav)_(.+)_(with925|no925)_est(\d+)$", col)
     if not m:
-        return {
-            "metric": col.split("_")[0],
-            "window": col,
-            "variant": np.nan,
-            "est": np.nan,
-        }
+        return {"metric": col.split("_")[0], "window": col, "variant": np.nan, "est": np.nan}
     metric, window, variant, est = m.groups()
-    return {
-        "metric": metric,
-        "window": window,
-        "variant": variant,
-        "est": int(est),
-    }
+    return {"metric": metric, "window": window, "variant": variant, "est": int(est)}
+
+
+# ── Worker ────────────────────────────────────────────────────────
+
+# Global shared across workers (set by initializer)
+_IPO_TIMES: dict = {}
+
+
+def _init_worker(ipo_times: dict):
+    global _IPO_TIMES
+    _IPO_TIMES = ipo_times
+
+
+def _process_ipo_chunk(ipo_df: pd.DataFrame) -> list:
+    """处理单个 ipo_id 的所有 (rival_fc, event_date) 组合，返回行列表。"""
+    rows = []
+    for (ipo_id, rival_fc, event_date), grp in ipo_df.groupby(
+        ["ipo_id", "rival_fc", "event_date"], sort=False
+    ):
+        grp = grp.sort_values("timestamp").reset_index(drop=True)
+        ts  = grp["timestamp"]
+
+        start_t, end_t = _IPO_TIMES.get(ipo_id, (None, None))
+        d = event_date.date()
+        rs_start = (
+            pd.Timestamp(d.year, d.month, d.day, start_t.hour, start_t.minute)
+            if start_t is not None else None
+        )
+        rs_end = (
+            pd.Timestamp(d.year, d.month, d.day, end_t.hour, end_t.minute)
+            if end_t is not None else None
+        )
+
+        day_open_w = pd.Timestamp(d.year, d.month, d.day, 9, 25)
+        day_close  = pd.Timestamp(d.year, d.month, d.day, 15, 0)
+
+        masks_w = {
+            "full_day":           (ts >= day_open_w) & (ts <= day_close),
+            "before_start_30min": _bars_before(ts, rs_start, N_BARS_30MIN),
+            "before_start_1hr":   _bars_before(ts, rs_start, N_BARS_1HR),
+            "after_start_30min":  _bars_after( ts, rs_start, N_BARS_30MIN),
+            "after_start_1hr":    _bars_after( ts, rs_start, N_BARS_1HR),
+            "after_end_30min":    _bars_after( ts, rs_end,   N_BARS_30MIN),
+            "after_end_1hr":      _bars_after( ts, rs_end,   N_BARS_1HR),
+        }
+
+        row = {"ipo_id": ipo_id, "rival_fc": rival_fc, "event_date": str(event_date.date())}
+        for win in WINDOWS:
+            mask = masks_w[win]
+            for est, ar_col, av_col in zip(EST_NUMS, AR_COLS, AV_COLS):
+                car_w, cav_w = _sum_window(grp, mask, ar_col, av_col, exclude_925=False)
+                car_n, cav_n = _sum_window(grp, mask, ar_col, av_col, exclude_925=True)
+                row[f"car_{win}_with925_est{est}"] = car_w
+                row[f"cav_{win}_with925_est{est}"] = cav_w
+                row[f"car_{win}_no925_est{est}"]   = car_n
+                row[f"cav_{win}_no925_est{est}"]   = cav_n
+
+        rows.append(row)
+    return rows
 
 
 # ── 主函数 ────────────────────────────────────────────────────────
@@ -137,96 +203,39 @@ def main():
     df_index.rename(columns={"INDEX2009": "ipo_id"}, inplace=True)
     df_index = df_index.drop_duplicates("ipo_id")
 
-    # 构建 ipo_id → (roadshow_start time, roadshow_end time) 映射
-    def _times(row):
-        return (
-            parse_time(row["roadshow_start"]),
-            parse_time(row["roadshow_end"]),
-        )
-
-    ipo_times = {row["ipo_id"]: _times(row) for _, row in df_index.iterrows()}
+    ipo_times = {
+        row["ipo_id"]: (parse_time(row["roadshow_start"]), parse_time(row["roadshow_end"]))
+        for _, row in df_index.iterrows()
+    }
 
     print("读取逐 bar AR/AV 序列...")
     df = pd.read_csv(INPUT_FILE, low_memory=False)
-    df["timestamp"]   = pd.to_datetime(df["timestamp"])
-    df["event_date"]  = pd.to_datetime(df["event_date"])
-    df["_time"]       = df["timestamp"].dt.time
+    df["timestamp"]  = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
+    df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
+    df["_time"]      = df["timestamp"].dt.time
 
-    ar_cols = ["ar_est1", "ar_est2", "ar_est3"]
-    av_cols = ["av_est1", "av_est2", "av_est3"]
-    est_nums = [1, 2, 3]
+    # 按 ipo_id 分块，每块传给一个 worker
+    ipo_ids   = df["ipo_id"].unique()
+    total_ipos = len(ipo_ids)
+    chunks    = [df[df["ipo_id"] == iid] for iid in ipo_ids]
 
-    windows = [
-        "full_day",
-        "before_start_30min",
-        "before_start_1hr",
-        "after_start_30min",
-        "after_start_1hr",
-        "after_end_30min",
-        "after_end_1hr",
-    ]
+    print(f"共 {total_ipos:,} 个 ipo_id，使用 {CPU_NUM} 个进程切分窗口...")
 
     all_rows = []
-
-    grouped = df.groupby(["ipo_id", "rival_fc", "event_date"])
-    total   = len(grouped)
-
-    print(f"共 {total:,} 个 (ipo_id, rival_fc, event_date) 组合，开始切分窗口...")
-
-    for idx_grp, ((ipo_id, rival_fc, event_date), grp) in enumerate(grouped):
-        grp = grp.sort_values("timestamp").reset_index(drop=True)
-        ts  = grp["timestamp"]
-
-        # 路演开始 / 结束时间戳
-        start_t, end_t = ipo_times.get(ipo_id, (None, None))
-        d = event_date.date()
-        rs_start = (
-            pd.Timestamp(d.year, d.month, d.day, start_t.hour, start_t.minute)
-            if start_t is not None else None
-        )
-        rs_end = (
-            pd.Timestamp(d.year, d.month, d.day, end_t.hour, end_t.minute)
-            if end_t is not None else None
-        )
-
-        # 路演日全天边界
-        day_open_w  = pd.Timestamp(d.year, d.month, d.day, 9, 25)
-        day_open_n  = pd.Timestamp(d.year, d.month, d.day, 9, 30)
-        day_close   = pd.Timestamp(d.year, d.month, d.day, 15, 0)
-
-        # 各窗口的 bar 掩码（with925 / no925 共用同一 bar 集，no925 在求和时剔除）
-        masks_w = {
-            "full_day":            (ts >= day_open_w)  & (ts <= day_close),
-            "before_start_30min":  _bars_before(ts, rs_start, N_BARS_30MIN),
-            "before_start_1hr":    _bars_before(ts, rs_start, N_BARS_1HR),
-            "after_start_30min":   _bars_after( ts, rs_start, N_BARS_30MIN),
-            "after_start_1hr":     _bars_after( ts, rs_start, N_BARS_1HR),
-            "after_end_30min":     _bars_after( ts, rs_end,   N_BARS_30MIN),
-            "after_end_1hr":       _bars_after( ts, rs_end,   N_BARS_1HR),
-        }
-
-        row = {"ipo_id": ipo_id, "rival_fc": rival_fc, "event_date": str(event_date.date())}
-
-        for win in windows:
-            mask = masks_w[win]
-            for est, ar_col, av_col in zip(est_nums, ar_cols, av_cols):
-                car_w, cav_w = _sum_window(grp, mask, ar_col, av_col, exclude_925=False)
-                car_n, cav_n = _sum_window(grp, mask, ar_col, av_col, exclude_925=True)
-                row[f"car_{win}_with925_est{est}"] = car_w
-                row[f"cav_{win}_with925_est{est}"] = cav_w
-                row[f"car_{win}_no925_est{est}"]   = car_n
-                row[f"cav_{win}_no925_est{est}"]   = cav_n
-
-        all_rows.append(row)
-
-        if (idx_grp + 1) % 5000 == 0:
-            pct = (idx_grp + 1) / total * 100
-            print(f"  [{idx_grp+1:>7}/{total}] ({pct:.1f}%)")
+    with mp.Pool(
+        processes=CPU_NUM,
+        initializer=_init_worker,
+        initargs=(ipo_times,),
+    ) as pool:
+        for i, rows in enumerate(pool.imap_unordered(_process_ipo_chunk, chunks, chunksize=4), 1):
+            all_rows.extend(rows)
+            if i % 200 == 0 or i == total_ipos:
+                print(f"  [{i:>5}/{total_ipos}] ({i/total_ipos*100:.1f}%)")
 
     print("保存窗口结果...")
     df_out = pd.DataFrame(all_rows)
     df_out.to_csv(OUTPUT_WINDOWS, index=False, encoding="utf-8-sig")
-    print(f"  → {OUTPUT_WINDOWS}")
+    print(f"  → {OUTPUT_WINDOWS}  ({len(df_out):,} 行)")
 
     print("计算各 IPO 竞争公司均值...")
     value_cols = [c for c in df_out.columns if c.startswith(("car_", "cav_"))]
@@ -238,39 +247,28 @@ def main():
     df_mean.to_csv(OUTPUT_MEAN, index=False, encoding="utf-8-sig")
     print(f"  → {OUTPUT_MEAN}")
 
-
     df_mean["year"] = pd.to_datetime(df_mean["event_date"]).dt.year
     year_results = {}
     for year, group in df_mean.groupby("year"):
         year_results[year] = {}
         for col in value_cols:
-            mean_val = group[col].mean()
-            max_val = group[col].max()
-            min_val = group[col].min()
-            std_val = group[col].std()
-            p95_val = group[col].quantile(0.95)
-            p5_val = group[col].quantile(0.05)
             year_results[year][col] = {
-                "mean": mean_val,
-                "max": max_val,
-                "min": min_val,
-                "std": std_val,
-                "p95": p95_val,
-                "p5": p5_val,
+                "mean": group[col].mean(),
+                "max":  group[col].max(),
+                "min":  group[col].min(),
+                "std":  group[col].std(),
+                "p95":  group[col].quantile(0.95),
+                "p5":   group[col].quantile(0.05),
             }
     df_year_stats = pd.DataFrame([
-        {
-            "year": year,
-            **_parse_value_col(col),
-            **stats,
-        }
+        {"year": year, **_parse_value_col(col), **stats}
         for year, cols in year_results.items()
         for col, stats in cols.items()
     ])
     stats_output = OUTPUT_MEAN.with_name("car_cav_windows_year_stats.csv")
     df_year_stats.to_csv(stats_output, index=False, encoding="utf-8-sig")
     print(f"  → {stats_output}")
-        
+
     print("完成。")
 
 
