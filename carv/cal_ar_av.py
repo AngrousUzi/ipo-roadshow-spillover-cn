@@ -16,7 +16,7 @@
   （时间窗口切片由 cal_windows.py 完成）
 
 输出：
-  carv/output/car_cav_results.csv
+  carv/output/ar_av_results.csv
   每行 = 1只竞争公司 × 1个事件 × 1个 5min bar
   列：ipo_id, rival_fc, event_date, timestamp,
       ar_est1, ar_est2, ar_est3,   # 逐 bar 异常收益（非累积）
@@ -84,7 +84,7 @@ EST3_START_OFFSET = -5     # 包含
 EST3_END_OFFSET   = -2     # 包含
 EVENT_START_OFFSET = -1
 EVENT_END_OFFSET   = 1     
-OUTPUT_FILE       = OUTPUT_DIR / "car_cav_results.csv"
+OUTPUT_FILE       = OUTPUT_DIR / "ar_av_results.csv"
 ERROR_LOG         = OUTPUT_DIR / "errors.txt"
 CPU_NUM =int(os.getenv("SLURM_CPUS_PER_TASK", 10)) 
 

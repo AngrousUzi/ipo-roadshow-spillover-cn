@@ -43,7 +43,7 @@ if os.name == "nt":
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
     ANN_DIR      = PROJECT_ROOT / "anns"
 else:
-    ANN_DIR = Path("./anns").resolve()
+    ANN_DIR = Path("./").resolve()
 
 CARV_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = CARV_DIR / "output"
@@ -210,9 +210,10 @@ def main():
 
     print("读取逐 bar AR/AV 序列...")
     df = pd.read_csv(INPUT_FILE, low_memory=False)
-    df["timestamp"]  = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
-    df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
-    df["_time"]      = df["timestamp"].dt.time
+    df["timestamp"]   = pd.to_datetime(df["timestamp"],errors="coerce")
+    df.dropna(subset=["timestamp"], inplace=True)  # 丢弃 timestamp 无效的行
+    df["event_date"]  = pd.to_datetime(df["event_date"])
+    df["_time"]       = df["timestamp"].dt.time
 
     # 按 ipo_id 分块，每块传给一个 worker
     ipo_ids   = df["ipo_id"].unique()
