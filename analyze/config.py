@@ -39,7 +39,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── 分析参数 ────────────────────────────────────────────────────────
 # 视觉分析：每秒采样帧数（越高越精确，越慢）
-VISUAL_SAMPLE_FPS = 12
+VISUAL_SAMPLE_FPS = 1
 
 # GPU 批推理配置（visual_fer.py GPU 模式）
 GPU_DEVICE     = "cuda"   # "cuda" 或 "cpu"；代码内自动检测是否有 CUDA

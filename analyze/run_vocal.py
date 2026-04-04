@@ -117,7 +117,7 @@ def main():
     write_header = not OUTPUT_FILE.exists()
 
     # 批次写入：每 200 个写一次
-    BATCH_SIZE = 200
+    BATCH_SIZE = 20
     results_buf = []
 
     with multiprocessing.Pool(processes=num_workers) as pool:
