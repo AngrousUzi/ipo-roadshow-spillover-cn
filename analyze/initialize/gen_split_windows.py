@@ -59,7 +59,8 @@ if os.name == "nt":
 else:
     INDEX_PATH = PROJECT_ROOT / ".." / "IPO_index_selected_platforms.xlsx"
 
-NODE_DIR = DATA_ROOT / "videos" / "全景路演视频节点"
+NODE_DIR       = DATA_ROOT / "videos" / "全景路演视频节点"
+NODE_DIR_CSCOM = DATA_ROOT / "videos" / "中证路演视频节点"
 
 # Transcription directories per platform.
 # 全景 uses the de-hallucinated directory only; IR / 中证 have no separate
@@ -129,18 +130,24 @@ def _is_v2_node(title: str) -> bool:
 
 
 def _is_v1_node(title: str) -> bool:
-    """True when the node marks the start of 推介致辞 / presentation speech."""
+    """
+    True when the node marks the start of 推介致辞 / presentation speech.
+
+    Matches 全景致辞 / 全景致词 style labels only.
+    Explicitly excludes 全景推介 (company IR pitch section within v1) and
+    all housekeeping / Q&A labels.
+    """
     if _is_v2_node(title):
         return False
-    # Exclude housekeeping / Q&A sections that do not contain speech
+    # Exclude housekeeping / Q&A / IR-pitch sections
     for excl in (
         "发行概况", "发行信息", "宣传片", "嘉宾介绍",
         "全景交流", "网上交流", "现场答题", "全景互动",
-        "现场报道", "我在现场",
+        "现场报道", "我在现场", "推介",
     ):
         if excl in title:
             return False
-    return bool(re.search(r"致辞|致词|推介|发言", title))
+    return bool(re.search(r"致辞|致词|发言", title))
 
 
 def _load_node_csv(csv_path: Path) -> list[dict]:
@@ -179,9 +186,9 @@ def detect_from_nodes(csv_path: Path) -> dict:
     """
     Derive v1_start, v1_end, v2_start from a node CSV.
 
-    v1_start : first 致辞/推介 node
+    v1_start : first 全景致辞 / 致辞 / 致词 node (excludes 推介 labels)
     v1_end   : first Q&A node (全景交流/网上交流/全景互动/现场答题)
-    v2_start : first 结束致辞/总结发言 node
+    v2_start : first 结束致辞/路演结束/总结发言 node
     """
     nodes = _load_node_csv(csv_path)
     if not nodes:
@@ -198,7 +205,7 @@ def detect_from_nodes(csv_path: Path) -> dict:
             v1_start = float(n["seconds"])
             v1_title = n["title"]
         if v1_end is None and _is_qa_node(n["title"]):
-            v1_end   = float(n["seconds"])
+            v1_end       = float(n["seconds"])
             v1_end_title = n["title"]
         if _is_v2_node(n["title"]):
             v2_start = float(n["seconds"])
@@ -250,11 +257,11 @@ def _is_qa_trans(text: str) -> bool:
         return True
     return False
 
-# Patterns marking the start of 答谢致辞 (v2 start)
+# Patterns marking the start of 答谢致辞 (v2 start).
+# NOTE: do NOT include pure closing lines ("路演到此结束" etc.) here —
+# those appear at the very end and belong only to _TRANS_V2_END_RE.
 _TRANS_V2_RE = re.compile(
     r"(接|临)近尾声|答谢致辞|总结发言|路演即将结束|告一段落"
-    r"|路演.{0,15}到此.{0,5}全部结束"
-    r"|感谢.{2,10}的(精彩)?发言.{0,60}全部结束"
 )
 
 # Patterns marking the end of 答谢致辞 (v2 end)
@@ -384,11 +391,17 @@ def detect_from_trans(trans_path: Path) -> dict:
 
 # ── Node CSV file lookup ───────────────────────────────────────────────────────
 
-def find_node_csv(code: str, date: str) -> Path | None:
-    """Find 全景 node CSV by stock code and date. Returns None if absent."""
-    if not NODE_DIR.exists():
+def find_node_csv(code: str, date: str, platform: str = "全景") -> Path | None:
+    """
+    Find a node CSV by stock code and date.
+    For 全景: looks in NODE_DIR        → pattern ``{code}_*_{date}.csv``
+    For 中证: looks in NODE_DIR_CSCOM  → pattern ``{code}_*_{date}_*.csv``
+    Returns None if absent.
+    """
+    node_dir = NODE_DIR_CSCOM if platform == "中证" else NODE_DIR
+    if not node_dir.exists():
         return None
-    for p in NODE_DIR.glob(f"{code}_*_{date}.csv"):
+    for p in node_dir.glob(f"{code}_*_{date}*.csv"):
         return p
     return None
 
@@ -415,7 +428,7 @@ def _detect_one(
 
     # ── Node CSV (全景 and 中证): takes full priority when present ──────────
     if platform in ("全景", "中证"):
-        node_csv = find_node_csv(code, date)
+        node_csv = find_node_csv(code, date, platform)
         if node_csv is not None:
             nd = detect_from_nodes(node_csv)
             note_parts.append(f"[节点]{nd['notes']}")
