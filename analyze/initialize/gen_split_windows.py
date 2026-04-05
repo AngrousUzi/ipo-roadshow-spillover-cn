@@ -56,8 +56,10 @@ import os
 
 if os.name == "nt":
     INDEX_PATH = PROJECT_ROOT / "anns" / "IPO_index_selected_platforms.xlsx"
+    NODE_DIR = DATA_ROOT / "videos" / "全景路演视频节点"
 else:
     INDEX_PATH = PROJECT_ROOT / ".." / "IPO_index_selected_platforms.xlsx"
+    NODE_DIR = DATA_ROOT / "全景路演视频节点"
 
 NODE_DIR       = DATA_ROOT / "videos" / "全景路演视频节点"
 NODE_DIR_CSCOM = DATA_ROOT / "videos" / "中证路演视频节点"
@@ -66,12 +68,12 @@ NODE_DIR_CSCOM = DATA_ROOT / "videos" / "中证路演视频节点"
 # 全景 uses the de-hallucinated directory only; IR / 中证 have no separate
 # 去幻觉 variant so we use their base directory.
 TRANS_DIRS: dict[str, list[Path]] = {
-    "全景": [DATA_ROOT / "路演转录_去幻觉"],
+    "全景": [DATA_ROOT / "全景路演转录_去幻觉"],
     "IR":   [DATA_ROOT / "IR路演转录_去幻觉"],
     "中证": [DATA_ROOT / "中证路演转录_去幻觉"],
 }
 
-OUT_PATH = PROJECT_ROOT / "tmp" / "video_split_windows.csv"
+OUT_PATH = PROJECT_ROOT / "analyze" / "initialize" / "video_split_windows.csv"
 
 _FIELDNAMES = [
     "index2009", "code", "date", "platform", "video_path",
