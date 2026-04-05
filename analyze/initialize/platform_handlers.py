@@ -74,9 +74,10 @@ class VideoSplitPlan:
 
     # SPLIT mode
     full_source:  Path | None  = None
-    v1_start_sec: float        = 0.0       # 推介致辞 clip start
-    split_time:   float | None = None      # 答谢致辞 clip start (split boundary)
-    v2_end_sec:   float | None = None      # 答谢致辞 clip end; None = EOF
+    v1_start_sec: float        = 0.0   # 推介致辞 clip start
+    v1_end_sec:   float | None = None  # 推介致辞 clip end (= QA start); None = split_time
+    split_time:   float | None = None  # 答谢致辞 clip start; None = no 答谢致辞
+    v2_end_sec:   float | None = None  # 答谢致辞 clip end; None = EOF
 
     @property
     def is_split_mode(self) -> bool:
@@ -143,19 +144,17 @@ def _apply_split_windows(plan: VideoSplitPlan, windows: dict[str, dict]) -> None
         except ValueError:
             return None
 
-    v1 = _f("v1_start_sec")
-    v2 = _f("v2_start_sec")
-    ve = _f("v2_end_sec")
+    v1  = _f("v1_start_sec")
+    v1e = _f("v1_end_sec")
+    v2  = _f("v2_start_sec")
+    ve  = _f("v2_end_sec")
 
-    if v2 is None:
-        # v2 missing → flag still needs manual review; leave split_time=None
-        # so the worker falls back to runtime transcript detection
-        return
-
-    plan.split_time   = v2
-    plan.v2_end_sec   = ve
     if v1 is not None:
         plan.v1_start_sec = v1
+    if v1e is not None:
+        plan.v1_end_sec = v1e
+    plan.split_time = v2   # None means no 答谢致辞 — that's valid
+    plan.v2_end_sec = ve
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

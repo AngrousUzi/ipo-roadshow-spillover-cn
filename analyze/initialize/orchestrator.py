@@ -69,9 +69,10 @@ class VideoTaskResult:
     v2_error:     str
     v1_quality:   dict = field(default_factory=dict)
     v2_quality:   dict = field(default_factory=dict)
-    v1_start_sec: float        = 0.0   # actual start used for 推介 clip
-    split_time:   float | None = None  # actual split boundary used
-    v2_end_sec:   float | None = None  # actual end used for 答谢 clip
+    v1_start_sec: float        = 0.0   # actual start of 推介 clip
+    v1_end_sec:   float | None = None  # actual end of 推介 clip (= QA start)
+    split_time:   float | None = None  # actual start of 答谢 clip
+    v2_end_sec:   float | None = None  # actual end of 答谢 clip
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -144,25 +145,22 @@ def _produce_from_split(
     assert plan.full_source is not None
 
     # ── Resolve split boundary ─────────────────────────────────────────────
-    split_time   = plan.split_time   # v2_start_sec from table; None = no 答谢致辞
-    v1_start_sec = plan.v1_start_sec # v1_start_sec from table; default 0.0
-    v2_end_sec   = plan.v2_end_sec   # v2_end_sec from table; None = EOF
+    v1_start_sec = plan.v1_start_sec  # 推介致辞 clip start
+    v1_end_sec   = plan.v1_end_sec    # 推介致辞 clip end (= QA start); None = skip v1
+    split_time   = plan.split_time    # 答谢致辞 clip start; None = no 答谢致辞
+    v2_end_sec   = plan.v2_end_sec    # 答谢致辞 clip end; None = EOF
 
-    # Determine what needs to be produced.
-    # v1 is meaningful when its start is non-zero OR there is a split boundary.
-    # v2 only exists when split_time is set.
-    has_v1 = v1_start_sec > 0 or split_time is not None
+    has_v1 = v1_end_sec is not None   # v1 only produced when end is known
     has_v2 = split_time is not None
 
-    if not has_v1:
+    if not has_v1 and not has_v2:
         msg = (
             f"index={plan.index2009} code={plan.code}: "
             f"split_windows 中无有效切分点，跳过"
         )
         print(f"[SKIP] {msg}")
-        return False, msg, {}, False, msg, {}, v1_start_sec, None, None
+        return False, msg, {}, False, msg, {}, v1_start_sec, v1_end_sec, None, None
 
-    # ── Check existing outputs ─────────────────────────────────────────────
     def _check_existing(p: Path) -> tuple[bool, dict] | None:
         if p.exists():
             q = check_video_quality(p, full_decode=full_decode)
@@ -175,19 +173,21 @@ def _produce_from_split(
     if not src.exists():
         msg = f"完整视频不存在: {src}"
         print(f"[ERROR] {msg}")
-        return False, msg, {}, False, msg, {}, v1_start_sec, split_time, v2_end_sec
+        return False, msg, {}, False, msg, {}, v1_start_sec, v1_end_sec, split_time, v2_end_sec
 
-    # ── Cut v1 (推介致辞): [v1_start_sec, split_time or EOF] ──────────────
-    v1_ok, v1_err, v1_q = True, "", {}
-    v1_done = _check_existing(v1_output)
-    if not v1_done:
-        v1_ok, v1_err = cut_video(
-            src, v1_output, start_sec=v1_start_sec, end_sec=split_time
-        )
-        if v1_ok:
-            v1_q = check_video_quality(v1_output, full_decode=full_decode)
-    else:
-        v1_ok, v1_q = v1_done
+    # ── Cut v1 (推介致辞): [v1_start_sec, v1_end_sec] ─────────────────────
+    v1_ok, v1_err, v1_q = False, "无推介致辞切分点", {}
+    if has_v1:
+        v1_done = _check_existing(v1_output)
+        if not v1_done:
+            v1_ok, v1_err = cut_video(
+                src, v1_output, start_sec=v1_start_sec, end_sec=v1_end_sec
+            )
+            if v1_ok:
+                v1_q = check_video_quality(v1_output, full_decode=full_decode)
+        else:
+            v1_ok, v1_q = v1_done
+            v1_err = ""
 
     # ── Cut v2 (答谢致辞): [split_time, v2_end_sec or EOF] ────────────────
     v2_ok, v2_err, v2_q = False, "无答谢致辞", {}
@@ -204,7 +204,7 @@ def _produce_from_split(
             v2_err = ""
 
     return (v1_ok, v1_err, v1_q, v2_ok, v2_err, v2_q,
-            v1_start_sec, split_time, v2_end_sec)
+            v1_start_sec, v1_end_sec, split_time, v2_end_sec)
 
 
 # ── Multiprocessing worker ─────────────────────────────────────────────────────
@@ -242,7 +242,8 @@ def process_video_row(row_data: dict) -> dict:
         (
             result.v1_success, result.v1_error, result.v1_quality,
             result.v2_success, result.v2_error, result.v2_quality,
-            result.v1_start_sec, result.split_time, result.v2_end_sec,
+            result.v1_start_sec, result.v1_end_sec,
+            result.split_time,   result.v2_end_sec,
         ) = _produce_from_split(plan, v1_output, v2_output, full_decode)
     else:
         result.v1_success, result.v1_error, result.v1_quality = (
@@ -323,6 +324,7 @@ def collect_video_tasks(full_decode: bool = True) -> list[dict]:
             "v1_error":     r["v1_error"],
             "v2_error":     r["v2_error"],
             "v1_start_sec": r.get("v1_start_sec", 0.0),
+            "v1_end_sec":   r.get("v1_end_sec"),
             "split_time":   r.get("split_time"),
             "v2_end_sec":   r.get("v2_end_sec"),
         }
