@@ -1,7 +1,7 @@
 """
 analyze/initialize/cscom_plan.py
 =======================================
-Loads ``initialize/中证视频分类.xlsx`` and builds a per-company plan that
+Loads ``analyze/initialize/中证视频分类.xlsx`` and builds a per-company plan that
 describes which source video files should become 推介致辞 (v1) and which
 should become 答谢致辞 (v2).
 
@@ -33,7 +33,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import PROJECT_ROOT
 
-_EXCEL_PATH = PROJECT_ROOT / "initialize" / "中证视频分类.xlsx"
+_EXCEL_PATH = PROJECT_ROOT / "analyze" / "initialize" / "中证视频分类.xlsx"
 
 
 @dataclass
@@ -91,7 +91,7 @@ def _video_number(filename: str) -> int:
 
 def load_cscom_plans() -> dict[str, dict]:
     """
-    Parse ``initialize/中证视频分类.xlsx`` and return a dict mapping each
+    Parse ``analyze/initialize/中证视频分类.xlsx`` and return a dict mapping each
     company code to its :class:`CscomCompanyPlan` serialised as a plain
     dict (suitable for multiprocessing pickling).
 
