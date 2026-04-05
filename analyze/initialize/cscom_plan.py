@@ -108,30 +108,28 @@ def load_cscom_plans() -> dict[str, dict]:
 
     plans: dict[str, CscomCompanyPlan] = {}
 
-    for _, row in adopted.iterrows():
-        filename  = str(row["视频名称"]).strip()
-        vtype     = str(row["视频类型"]).strip()
-        code      = str(row["公司代码"]).strip()
-        needs_cut = str(row["需要切分"]).strip().lower() == "true"
+    for code, group in adopted.groupby("公司代码", sort=False):
+        code = str(code).strip()
+        plan = CscomCompanyPlan(code=code)
 
-        if code not in plans:
-            plans[code] = CscomCompanyPlan(code=code)
+        split_rows = group[group["需要切分"].str.lower() == "true"]
 
-        plan = plans[code]
-
-        # needs_split takes priority regardless of the 视频类型 label
-        # (some rows have an empty type but still need transcript-based cutting)
-        if needs_cut:
+        if not split_rows.empty:
+            # Split mode: one complete video to be cut at a transcript boundary
             plan.needs_split   = True
-            plan.full_filename = filename
-        elif vtype == "推介致辞":
-            plan.v1_filenames.append(filename)
-        elif vtype == "答谢致辞":
-            plan.v2_filenames.append(filename)
-        elif vtype == "完整视频":
-            # Complete video without a split marker — treat as v1
-            plan.v1_filenames.append(filename)
-        # 宣传片 and unrecognised/empty type → excluded
+            plan.full_filename = str(split_rows.iloc[0]["视频名称"]).strip()
+        else:
+            # Merge mode: only 推介致辞 (v1) and 答谢致辞 (v2) rows are used
+            for _, row in group.iterrows():
+                vtype    = str(row["视频类型"]).strip()
+                filename = str(row["视频名称"]).strip()
+                if vtype == "推介致辞":
+                    plan.v1_filenames.append(filename)
+                elif vtype == "答谢致辞":
+                    plan.v2_filenames.append(filename)
+                # 完整视频 without split marker, 宣传片, empty → excluded
+
+        plans[code] = plan
 
     # Sort by video number within each group
     for plan in plans.values():
