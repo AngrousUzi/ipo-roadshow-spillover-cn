@@ -218,7 +218,7 @@ def cut_video(
     if end_sec is not None:
         # -to is relative to the re-based timeline after input seeking
         cmd += ["-to", str(end_sec - start_sec)]
-    cmd += ["-c", "copy", str(temp_path)]
+    cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", str(temp_path)]
 
     try:
         result = subprocess.run(
