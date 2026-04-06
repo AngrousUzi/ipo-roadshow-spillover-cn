@@ -287,20 +287,23 @@ def iter_frame_chunks(
     sample_fps: float = 1.0,
     max_long_side: int = 720,
     chunk_size: int = 1024,
+    use_hwaccel: bool = True,
 ):
     """
     生成器：将视频按 chunk_size 帧分块 yield，供流式 GPU 推理使用。
     yield (chunk: list[np.ndarray], is_last: bool)
 
     解码策略（自动选择）：
-      1. ffmpeg + NVDEC（-hwaccel cuda）：H264/HEVC 解码在 GPU NVDEC 引擎，
+      1. ffmpeg + NVDEC（-hwaccel cuda，use_hwaccel=True）：H264/HEVC 解码在 GPU NVDEC 引擎，
          不占 CUDA core，也不占 CPU；fps 采样和 scale 由 ffmpeg 内部完成，
          Python 侧只做 pipe read + numpy reshape，CPU 占用极低。
-      2. ffmpeg 不可用时回退到 cv2 + cap.grab() 跳帧。
+      2. ffmpeg 可用但 use_hwaccel=False（CPU 节点）：ffmpeg 软解，无 CUDA 依赖。
+      3. ffmpeg 不可用时回退到 cv2 + cap.grab() 跳帧。
     """
     import shutil
     if shutil.which("ffmpeg") is not None:
-        yield from _iter_chunks_ffmpeg(video_path, sample_fps, max_long_side, chunk_size)
+        yield from _iter_chunks_ffmpeg(video_path, sample_fps, max_long_side, chunk_size,
+                                       use_hwaccel=use_hwaccel)
     else:
         yield from _iter_chunks_cv2(video_path, sample_fps, max_long_side, chunk_size)
 
@@ -310,6 +313,7 @@ def _iter_chunks_ffmpeg(
     sample_fps: float,
     max_long_side: int,
     chunk_size: int,
+    use_hwaccel: bool = True,
 ):
     """ffmpeg pipe + NVDEC 解码实现。"""
     import subprocess
@@ -336,12 +340,13 @@ def _iter_chunks_ffmpeg(
     else:
         ow, oh = w_orig, h_orig
 
-    # -hwaccel cuda : NVDEC 解码，不占 CUDA core
+    # -hwaccel cuda : NVDEC 解码，不占 CUDA core（仅 GPU 节点使用）
     # fps 滤镜      : ffmpeg 内部采样，无需 Python 跳帧
     # scale         : ffmpeg 内部 resize
-    cmd = [
-        "ffmpeg",
-        "-hwaccel", "cuda",
+    cmd = ["ffmpeg"]
+    if use_hwaccel:
+        cmd += ["-hwaccel", "cuda"]
+    cmd += [
         "-i", str(video_path),
         "-vf", f"fps={sample_fps},scale={ow}:{oh}",
         "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -352,9 +357,21 @@ def _iter_chunks_ffmpeg(
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         bufsize=frame_bytes * min(chunk_size, 64),
     )
+
+    # ── 后台线程读 ffmpeg stderr，捕获 CUDA 失败信息 ──────────────
+    ffmpeg_stderr_lines = []
+    def read_stderr():
+        try:
+            for line in iter(proc.stderr.readline, b''):
+                if line:
+                    ffmpeg_stderr_lines.append(line.decode('utf-8', errors='ignore').strip())
+        except Exception:
+            pass
+    stderr_thread = __import__('threading').Thread(target=read_stderr, daemon=True)
+    stderr_thread.start()
 
     try:
         chunk: list[np.ndarray] = []
@@ -370,7 +387,18 @@ def _iter_chunks_ffmpeg(
                 chunk = []
     finally:
         proc.stdout.close()
+        proc.stderr.close()
         proc.wait()
+        
+        # 检查 CUDA 失败标志，输出日志
+        cuda_failed = any("Cannot load libnvcuvid" in line or "Failed setup for format cuda" in line 
+                         for line in ffmpeg_stderr_lines)
+        if cuda_failed:
+            print(f"\n[⚠ CUDA FALLBACK] {video_path.name}")
+            print(f"     ffmpeg 使用了 CPU 软解。建议检查 LD_LIBRARY_PATH 中是否包含 NVIDIA CUDA lib 路径。")
+            for line in ffmpeg_stderr_lines:
+                if "nvcuvid" in line or "cuda" in line.lower():
+                    print(f"     {line}")
 
 
 def _iter_chunks_cv2(
@@ -422,15 +450,25 @@ def read_sampled_frames(
     video_path: Path,
     sample_fps: float = 1.0,
     max_long_side: int = 720,
+    use_hwaccel: bool = True,
 ) -> tuple[list[np.ndarray], float]:
     """
     从视频文件读取所有采样帧，返回 (frames, video_fps)。
     内部使用 iter_frame_chunks（ffmpeg NVDEC 或 cv2 回退）。
+
+    use_hwaccel=True（默认）：尝试 -hwaccel cuda；若 ffmpeg 返回 0 帧（CPU 节点上
+    CUDA 不可用导致 ffmpeg 静默退出），自动降级为软解重试。
+    use_hwaccel=False：直接用 ffmpeg 软解，适合 CPU-only 节点。
     """
     frames: list[np.ndarray] = []
     for chunk, _ in iter_frame_chunks(video_path, sample_fps, max_long_side,
-                                      chunk_size=100_000):
+                                      chunk_size=100_000, use_hwaccel=use_hwaccel):
         frames.extend(chunk)
+    # CUDA 不可用时 ffmpeg 静默退出返回 0 帧；自动降级软解重试
+    if not frames and use_hwaccel:
+        for chunk, _ in iter_frame_chunks(video_path, sample_fps, max_long_side,
+                                          chunk_size=100_000, use_hwaccel=False):
+            frames.extend(chunk)
     return frames, 0.0   # video_fps 调用方均以 _ 丢弃，返回 0.0 兼容
 
 
