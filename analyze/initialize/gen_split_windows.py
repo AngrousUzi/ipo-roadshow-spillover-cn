@@ -201,11 +201,15 @@ def detect_from_nodes(csv_path: Path) -> dict:
     v1_end:   float | None = None
     v2_start: float | None = None
     v1_title = v1_end_title = v2_title = ""
+    v1_promo_end: float | None = None  # 宣传片 node appearing after v1_start
 
     for n in nodes:
         if v1_start is None and _is_v1_node(n["title"]):
             v1_start = float(n["seconds"])
             v1_title = n["title"]
+        # 宣传片 appearing after v1_start → candidate early end for v1 clip
+        if v1_start is not None and v1_promo_end is None and "宣传片" in n["title"]:
+            v1_promo_end = float(n["seconds"])
         if v1_end is None and _is_qa_node(n["title"]):
             v1_end       = float(n["seconds"])
             v1_end_title = n["title"]
@@ -213,6 +217,11 @@ def detect_from_nodes(csv_path: Path) -> dict:
             v2_start = float(n["seconds"])
             v2_title = n["title"]
             break
+
+    # Use promo node as v1_end if it appears before the QA boundary
+    if v1_promo_end is not None and (v1_end is None or v1_promo_end < v1_end):
+        v1_end       = v1_promo_end
+        v1_end_title = "宣传片"
 
     parts: list[str] = []
     if v1_start is not None:
@@ -237,7 +246,7 @@ def detect_from_nodes(csv_path: Path) -> dict:
 
 # Patterns marking the start of 推介致辞 (v1 start)
 _TRANS_V1_RE = re.compile(
-    r"推介致辞|推荐致辞|推介之词|推荐之词"
+    r"推介致辞|推荐致辞|推荐致词|推介之词|推荐之词"
     r"|全景致词环节|全景致辞环节"
     r"|有请.{2,40}(做.{0,4})?(致辞|致词|之词|发言)"
     r"|有请.{5,45}做推[荐介]"
@@ -333,11 +342,12 @@ def detect_from_trans(trans_path: Path) -> dict:
                 "v2_start_sec": None, "v2_end_sec": None,
                 "notes": "转录无segments"}
 
-    v1_start: float | None = None
-    v1_end:   float | None = None
-    v2_start: float | None = None
-    v2_end:   float | None = None
-    v1_text = v1_end_text = v2_text = v2_end_text = ""
+    v1_start:     float | None = None
+    v1_end:       float | None = None
+    v1_promo_end: float | None = None  # 宣传片 announcement after v1_start
+    v2_start:     float | None = None
+    v2_end:       float | None = None
+    v1_text = v1_end_text = v1_promo_text = v2_text = v2_end_text = ""
 
     for seg in segs:
         text = seg.get("text", "")
@@ -347,6 +357,13 @@ def detect_from_trans(trans_path: Path) -> dict:
             v1_start = float(ts)
             v1_text  = text[:60]
 
+        # 宣传片 announcement after v1_start → candidate early end for v1 clip
+        if v1_start is not None and v1_promo_end is None and (
+            "宣传片" in text or "短片" in text
+        ):
+            v1_promo_end  = float(ts)
+            v1_promo_text = text[:60]
+
         if v1_end is None and _is_qa_trans(text):
             v1_end      = float(ts)
             v1_end_text = text[:60]
@@ -354,6 +371,11 @@ def detect_from_trans(trans_path: Path) -> dict:
         if v2_start is None and _TRANS_V2_RE.search(text):
             v2_start = float(ts)
             v2_text  = text[:60]
+
+    # Use promo announcement as v1_end if it appears before the QA boundary
+    if v1_promo_end is not None and (v1_end is None or v1_promo_end < v1_end):
+        v1_end      = v1_promo_end
+        v1_end_text = f"宣传片「{v1_promo_text}」"
 
     # Gap-based fallback for v1_end when keyword detection fails
     if v1_end is None:
