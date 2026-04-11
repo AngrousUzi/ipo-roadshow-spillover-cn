@@ -61,7 +61,20 @@ WIN_STYLES_YEAR = [
 ]
 
 # ── Load common data once ─────────────────────────────────────────────────────
+START_GROUPS = [
+    ("all",      None,    "All roadshows"),
+    ("start_09", "09:00", "Roadshow start 09:00"),
+    ("start_14", "14:00", "Roadshow start 14:00"),
+]
+
 print("Loading base data ...")
+# Load start_time from IPO_index.xlsx
+_idx_xl = pd.read_excel(
+    os.path.join(SCRIPT_DIR, "..", "anns", "IPO_index.xlsx"),
+    usecols=[0, 8],
+)
+_idx_xl.columns = ["ipo_id", "start_time"]
+_idx_xl["start_time"] = _idx_xl["start_time"].astype(str).str.strip()
 carv_raw = pd.read_csv(
     os.path.join(SCRIPT_DIR, "output", "car_cav_windows.csv"),
     encoding="utf-8-sig",
@@ -77,6 +90,7 @@ idx = pd.read_csv(
 )
 idx.columns = ["stkcd_ipo", "ipo_id"]
 carv_raw = carv_raw.merge(idx, on="ipo_id", how="left")
+carv_raw = carv_raw.merge(_idx_xl, on="ipo_id", how="left")
 
 sim_data = pd.read_csv(
     os.path.join(SCRIPT_DIR, "..", "ind", "ind_all_sim_pairs_within_llm.csv"),
@@ -282,6 +296,10 @@ for dim in DIMS:
         lambda y: "Stage 1\n(2009–2015)" if y <= 2015 else "Stage 2\n(2016–2024)"
     )
     ipo = ipo.merge(ind_ipo, on=["stkcd_ipo", "year"], how="left")
+    ipo = ipo.merge(
+        _idx_xl[["ipo_id", "start_time"]].drop_duplicates("ipo_id"),
+        on="ipo_id", how="left",
+    )
     print(f"  IPO-level obs: {len(ipo):,}  with industry: {ipo['sector'].notna().sum():,}")
 
     # 4. Create output dirs
@@ -366,9 +384,13 @@ for dim in DIMS:
 
     print(f"  Stat output: {xlsx_path}")
 
-    # 8. Figures
-    make_window_figs(ipo, fig_dir, dim)
-    make_yearly_figs(ipo, fig_dir, dim)
+    # 8. Figures — loop over start-time groups
+    for grp_folder, start_filter, grp_label in START_GROUPS:
+        grp_fig_dir = os.path.join(fig_dir, grp_folder)
+        os.makedirs(grp_fig_dir, exist_ok=True)
+        ipo_grp = ipo if start_filter is None else ipo[ipo["start_time"] == start_filter]
+        make_window_figs(ipo_grp, grp_fig_dir, f"{dim} | {grp_label}")
+        make_yearly_figs(ipo_grp, grp_fig_dir, f"{dim} | {grp_label}")
 
     # Rival count figure
     fig, ax = plt.subplots(figsize=(10, 4.5))

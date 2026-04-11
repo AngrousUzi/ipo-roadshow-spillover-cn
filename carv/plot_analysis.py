@@ -1,16 +1,17 @@
 """
-For each of 6 intraday event windows, produce one figure showing:
-  - Rows: CAR (top) and CAV (bottom)
-  - Columns: Stage 1 (2009-2015) and Stage 2 (2016-2024)
-  - Within each panel: est1 / est2 / est3 grouped bars with 95% CI
+For each of 6 intraday event windows, produce figures showing:
+  - est1 / est2 / est3 grouped bars × Stage 1 / Stage 2
 
-6 output figures:
-  fig_pre_30min.png
-  fig_pre_1hr.png
-  fig_during_30min.png
-  fig_during_1hr.png
-  fig_post_30min.png
-  fig_post_1hr.png
+Figures are produced for three groups:
+  all/        : all roadshows
+  start_09/   : roadshows starting at 09:00
+  start_14/   : roadshows starting at 14:00
+
+Start time sourced from anns/IPO_index.xlsx (column '开始时间').
+
+Output structure under carv/output/figures/:
+  {group}/fig_{window}.png
+  {group}/fig_yearly_trend_{est}.png
 """
 
 import os
@@ -20,110 +21,78 @@ from scipy import stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 FIG_DIR = os.path.join(OUT_DIR, "figures")
-os.makedirs(FIG_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Window definitions: (figure_name, period_label, car_cols, cav_cols)
-# car_cols / cav_cols are [est1, est2, est3] for with925 variant
-# ---------------------------------------------------------------------------
 WINDOWS = [
-    (
-        "pre_30min", "Pre-roadshow 30 min",
-        ["car_before_start_30min_with925_est1",
-         "car_before_start_30min_with925_est2",
-         "car_before_start_30min_with925_est3"],
-        ["cav_before_start_30min_with925_est1",
-         "cav_before_start_30min_with925_est2",
-         "cav_before_start_30min_with925_est3"],
-    ),
-    (
-        "pre_1hr", "Pre-roadshow 1 hr",
-        ["car_before_start_1hr_with925_est1",
-         "car_before_start_1hr_with925_est2",
-         "car_before_start_1hr_with925_est3"],
-        ["cav_before_start_1hr_with925_est1",
-         "cav_before_start_1hr_with925_est2",
-         "cav_before_start_1hr_with925_est3"],
-    ),
-    (
-        "during_30min", "During roadshow (first 30 min)",
-        ["car_after_start_30min_with925_est1",
-         "car_after_start_30min_with925_est2",
-         "car_after_start_30min_with925_est3"],
-        ["cav_after_start_30min_with925_est1",
-         "cav_after_start_30min_with925_est2",
-         "cav_after_start_30min_with925_est3"],
-    ),
-    (
-        "during_1hr", "During roadshow (first 1 hr)",
-        ["car_after_start_1hr_with925_est1",
-         "car_after_start_1hr_with925_est2",
-         "car_after_start_1hr_with925_est3"],
-        ["cav_after_start_1hr_with925_est1",
-         "cav_after_start_1hr_with925_est2",
-         "cav_after_start_1hr_with925_est3"],
-    ),
-    (
-        "post_30min", "Post-roadshow 30 min",
-        ["car_after_end_30min_with925_est1",
-         "car_after_end_30min_with925_est2",
-         "car_after_end_30min_with925_est3"],
-        ["cav_after_end_30min_with925_est1",
-         "cav_after_end_30min_with925_est2",
-         "cav_after_end_30min_with925_est3"],
-    ),
-    (
-        "post_1hr", "Post-roadshow 1 hr",
-        ["car_after_end_1hr_with925_est1",
-         "car_after_end_1hr_with925_est2",
-         "car_after_end_1hr_with925_est3"],
-        ["cav_after_end_1hr_with925_est1",
-         "cav_after_end_1hr_with925_est2",
-         "cav_after_end_1hr_with925_est3"],
-    ),
+    ("pre_30min",    "Pre-roadshow 30 min",
+     [f"car_before_start_30min_with925_est{e}" for e in [1,2,3]],
+     [f"cav_before_start_30min_with925_est{e}" for e in [1,2,3]]),
+    ("pre_1hr",      "Pre-roadshow 1 hr",
+     [f"car_before_start_1hr_with925_est{e}"   for e in [1,2,3]],
+     [f"cav_before_start_1hr_with925_est{e}"   for e in [1,2,3]]),
+    ("during_30min", "During roadshow (first 30 min)",
+     [f"car_after_start_30min_with925_est{e}"  for e in [1,2,3]],
+     [f"cav_after_start_30min_with925_est{e}"  for e in [1,2,3]]),
+    ("during_1hr",   "During roadshow (first 1 hr)",
+     [f"car_after_start_1hr_with925_est{e}"    for e in [1,2,3]],
+     [f"cav_after_start_1hr_with925_est{e}"    for e in [1,2,3]]),
+    ("post_30min",   "Post-roadshow 30 min",
+     [f"car_after_end_30min_with925_est{e}"    for e in [1,2,3]],
+     [f"cav_after_end_30min_with925_est{e}"    for e in [1,2,3]]),
+    ("post_1hr",     "Post-roadshow 1 hr",
+     [f"car_after_end_1hr_with925_est{e}"      for e in [1,2,3]],
+     [f"cav_after_end_1hr_with925_est{e}"      for e in [1,2,3]]),
 ]
 
-# collect all needed columns
-ALL_COLS = []
-for _, _, car_cols, cav_cols in WINDOWS:
-    ALL_COLS += car_cols + cav_cols
+WINDOW_STYLES = [
+    ("pre 30min",    "car_before_start_30min_with925_est{e}", "cav_before_start_30min_with925_est{e}", "-",  "o"),
+    ("pre 1hr",      "car_before_start_1hr_with925_est{e}",   "cav_before_start_1hr_with925_est{e}",   "--", "o"),
+    ("during 30min", "car_after_start_30min_with925_est{e}",  "cav_after_start_30min_with925_est{e}",  "-",  "s"),
+    ("during 1hr",   "car_after_start_1hr_with925_est{e}",    "cav_after_start_1hr_with925_est{e}",    "--", "s"),
+    ("post 30min",   "car_after_end_30min_with925_est{e}",    "cav_after_end_30min_with925_est{e}",    "-",  "^"),
+    ("post 1hr",     "car_after_end_1hr_with925_est{e}",      "cav_after_end_1hr_with925_est{e}",      "--", "^"),
+]
+
+ALL_COLS = list({c for _, _, cc, cv in WINDOWS for c in cc + cv})
+
+STAGES      = ["Stage 1\n(2009–2015)", "Stage 2\n(2016–2024)"]
+STAGE_COLORS= ["#4878CF", "#D65F5F"]
+WIN_COLORS  = ["#4878CF", "#1F4E8C", "#E8851A", "#A85C00", "#4DAF52", "#2A7A2E"]
 
 # ---------------------------------------------------------------------------
-# Load and aggregate to IPO level
+# Load data
 # ---------------------------------------------------------------------------
 print("Loading car_cav_windows.csv ...")
 carv = pd.read_csv(os.path.join(OUT_DIR, "car_cav_windows.csv"), encoding="utf-8-sig")
 carv["event_date"] = pd.to_datetime(carv["event_date"])
 carv["year"] = carv["event_date"].dt.year
 
-idx = pd.read_csv(
-    os.path.join(os.path.dirname(__file__), "IPO_roadshow_index_2009_with_trading_days.csv"),
-    encoding="utf-8-sig", encoding_errors="replace",
-    usecols=["Stkcd", "INDEX2009"],
+print("Loading IPO_index.xlsx ...")
+idx = pd.read_excel(
+    os.path.join(os.path.dirname(__file__), "..", "anns", "IPO_index.xlsx"),
+    usecols=[0, 1, 8],
 )
-idx.columns = ["stkcd_ipo", "ipo_id"]
-carv = carv.merge(idx, on="ipo_id", how="left")
+idx.columns = ["ipo_id", "stkcd_ipo", "start_time"]
+idx["start_time"] = idx["start_time"].astype(str).str.strip()
+
+carv = carv.merge(idx[["ipo_id", "stkcd_ipo", "start_time"]], on="ipo_id", how="left")
 
 agg_cols = [c for c in ALL_COLS if c in carv.columns]
-ipo = (
-    carv.groupby(["ipo_id", "year"])[agg_cols]
+ipo_base = (
+    carv.groupby(["ipo_id", "year", "stkcd_ipo", "start_time"])[agg_cols]
     .mean()
     .reset_index()
 )
-ipo["stage"] = ipo["year"].apply(
+ipo_base["stage"] = ipo_base["year"].apply(
     lambda y: "Stage 1\n(2009–2015)" if y <= 2015 else "Stage 2\n(2016–2024)"
 )
-
-STAGES = ["Stage 1\n(2009–2015)", "Stage 2\n(2016–2024)"]
-STAGE_COLORS = ["#4878CF", "#D65F5F"]
-EST_LABELS = ["Est 1", "Est 2", "Est 3"]
-EST_HATCHES = ["", "//", ".."]
+print(f"IPO obs: {len(ipo_base)}  start_time breakdown:\n{ipo_base['start_time'].value_counts()}")
 
 # ---------------------------------------------------------------------------
-# Helper: mean ± 95% CI + significance star
+# Helpers
 # ---------------------------------------------------------------------------
 def summary(s):
     s = s.dropna()
@@ -136,159 +105,116 @@ def summary(s):
     star = "***" if p < 0.01 else ("**" if p < 0.05 else ("*" if p < 0.1 else ""))
     return m, m - 1.96 * se, m + 1.96 * se, star
 
-# ---------------------------------------------------------------------------
-# Draw one panel (ax) for a given metric and set of columns
-# ---------------------------------------------------------------------------
-def draw_panel(ax, df, cols, metric, ylabel):
-    """
-    Grouped bar chart: x-axis = Stage 1 / Stage 2
-                       groups  = est1, est2, est3
-    """
-    n_stages = len(STAGES)
-    n_ests   = len(cols)           # always 3
-    bw       = 0.22
-    offsets  = np.linspace(-(n_ests - 1) / 2 * bw, (n_ests - 1) / 2 * bw, n_ests)
-    x        = np.arange(n_stages)
-
-    for ei, (col, lbl, hatch) in enumerate(zip(cols, EST_LABELS, EST_HATCHES)):
+def draw_panel(ax, df, cols, ylabel, subtitle=""):
+    bw = 0.22
+    offsets = np.linspace(-bw, bw, 3)
+    x = np.arange(len(STAGES))
+    for ei, (col, hatch) in enumerate(zip(cols, ["", "//", ".."])):
         if col not in df.columns:
             continue
-        means, los, his, stars = [], [], [], []
+        ms, los, his, ss = [], [], [], []
         for stage in STAGES:
             sub = df[df["stage"] == stage][col]
             m, lo, hi, star = summary(sub)
-            means.append(m); los.append(lo); his.append(hi); stars.append(star)
-
-        for si in range(n_stages):
-            clr = STAGE_COLORS[si]
-            xi  = x[si] + offsets[ei]
-            ax.bar(xi, means[si], width=bw, color=clr, alpha=0.75,
-                   hatch=hatch, edgecolor="white", label=f"{lbl} ({STAGES[si].replace(chr(10),' ')})" if ei == 0 else None,
-                   zorder=3)
-            if not np.isnan(means[si]):
-                err_lo = means[si] - los[si]
-                err_hi = his[si] - means[si]
-                ax.errorbar(xi, means[si], yerr=[[err_lo], [err_hi]],
+            ms.append(m); los.append(lo); his.append(hi); ss.append(star)
+        for si in range(len(STAGES)):
+            xi = x[si] + offsets[ei]
+            ax.bar(xi, ms[si], width=bw, color=STAGE_COLORS[si],
+                   alpha=0.75, hatch=hatch, edgecolor="white", zorder=3)
+            if not np.isnan(ms[si]):
+                ax.errorbar(xi, ms[si],
+                            yerr=[[ms[si] - los[si]], [his[si] - ms[si]]],
                             fmt="none", color="black", capsize=3, linewidth=1, zorder=4)
-                if stars[si]:
-                    ypos = his[si] if means[si] >= 0 else los[si]
-                    vshift = abs(means[si]) * 0.08 + abs(his[si] - los[si]) * 0.05
-                    ax.text(xi, ypos + vshift if means[si] >= 0 else ypos - vshift,
-                            stars[si], ha="center",
-                            va="bottom" if means[si] >= 0 else "top",
+                if ss[si]:
+                    ypos = his[si] if ms[si] >= 0 else los[si]
+                    shift = abs(ms[si]) * 0.08 + abs(his[si] - los[si]) * 0.05
+                    ax.text(xi, ypos + shift if ms[si] >= 0 else ypos - shift,
+                            ss[si], ha="center",
+                            va="bottom" if ms[si] >= 0 else "top",
                             fontsize=8, color="#800000", fontweight="bold")
-
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", zorder=2)
-    ax.set_xticks(x)
-    ax.set_xticklabels(STAGES, fontsize=10)
-    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_xticks(x); ax.set_xticklabels(STAGES, fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
+    if subtitle:
+        ax.set_title(subtitle, fontsize=9)
     ax.grid(axis="y", alpha=0.3, zorder=0)
+    handles = ([mpatches.Patch(facecolor="gray", hatch=h, edgecolor="black",
+                               label=f"Est {i+1}", alpha=0.7)
+                for i, h in enumerate(["", "//", ".."])] +
+               [mpatches.Patch(facecolor=c, label=s.replace("\n", " "), alpha=0.8)
+                for s, c in zip(STAGES, STAGE_COLORS)])
+    ax.legend(handles=handles, fontsize=7, ncol=2, framealpha=0.7)
 
-    # Custom legend: est patterns + stage colors
-    from matplotlib.patches import Patch
-    legend_handles = []
-    for ei, (lbl, hatch) in enumerate(zip(EST_LABELS, EST_HATCHES)):
-        legend_handles.append(
-            Patch(facecolor="gray", hatch=hatch, edgecolor="black", label=lbl, alpha=0.7)
+def make_window_figs(ipo, fig_dir, group_label):
+    for fname, period_label, car_cols, cav_cols in WINDOWS:
+        fig, (ax_car, ax_cav) = plt.subplots(1, 2, figsize=(12, 5.5))
+        fig.suptitle(
+            f"Rival-Firm Abnormal Return & Volume — {period_label}\n"
+            f"({group_label}, with 9:25 auction, est1/2/3)",
+            fontsize=11, fontweight="bold",
         )
-    for stage, clr in zip(STAGES, STAGE_COLORS):
-        legend_handles.append(
-            Patch(facecolor=clr, label=stage.replace("\n", " "), alpha=0.8)
+        draw_panel(ax_car, ipo, car_cols, "CAR (cumul. abnormal return)", "CAR")
+        draw_panel(ax_cav, ipo, cav_cols, "CAV (cumul. abnormal volume)", "CAV")
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, f"fig_{fname}.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+def make_yearly_figs(ipo, fig_dir, group_label):
+    years = sorted(ipo["year"].unique())
+    for est in ["est1", "est2", "est3"]:
+        fig, (ax_car, ax_cav) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        fig.suptitle(
+            f"Yearly Trend by Event Window — {est.upper()}\n({group_label}, with 9:25 auction)",
+            fontsize=11, fontweight="bold",
         )
-    ax.legend(handles=legend_handles, fontsize=7, ncol=2,
-              loc="best", framealpha=0.7)
+        for (label, car_tmpl, cav_tmpl, ls, mk), clr in zip(WINDOW_STYLES, WIN_COLORS):
+            car_col = car_tmpl.format(e=est[-1])
+            cav_col = cav_tmpl.format(e=est[-1])
+            for ax, col in [(ax_car, car_col), (ax_cav, cav_col)]:
+                if col not in ipo.columns:
+                    continue
+                ms = [ipo[ipo["year"] == y][col].mean() for y in years]
+                ax.plot(years, ms, linestyle=ls, marker=mk, color=clr,
+                        label=label, linewidth=1.6, markersize=5)
+        for ax, metric in [(ax_car, "CAR"), (ax_cav, "CAV")]:
+            ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
+            ax.axvspan(2008.5, 2015.5, alpha=0.07, color="#4878CF")
+            ax.axvspan(2015.5, 2024.5, alpha=0.07, color="#D65F5F")
+            ax.set_ylabel(metric, fontsize=11)
+            ax.grid(axis="y", alpha=0.3)
+            ax.legend(fontsize=8, ncol=3, loc="upper right", framealpha=0.8)
+        ax_cav.set_xticks(years)
+        ax_cav.set_xticklabels(years, rotation=45, fontsize=8)
+        ax_cav.set_xlabel("Year", fontsize=10)
+        ax_car.set_title("CAR", fontsize=10, fontweight="bold")
+        ax_cav.set_title("CAV", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, f"fig_yearly_trend_{est}.png"),
+                    dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
 # ---------------------------------------------------------------------------
-# Main loop: one figure per window
+# Run for each group: all, 09:00, 14:00
 # ---------------------------------------------------------------------------
-print("Drawing figures ...")
-for fname, period_label, car_cols, cav_cols in WINDOWS:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-    fig.suptitle(
-        f"Rival-Firm Abnormal Return & Volume — {period_label}\n"
-        f"(IPO-level mean across rivals, with 9:25 auction, est1/2/3)",
-        fontsize=12, fontweight="bold",
-    )
-
-    draw_panel(axes[0], ipo, car_cols, "CAR",
-               "CAR (cumulative abnormal return)")
-    draw_panel(axes[1], ipo, cav_cols, "CAV",
-               "CAV (cumulative abnormal volume)")
-
-    axes[0].set_title("CAR", fontsize=11, fontweight="bold")
-    axes[1].set_title("CAV", fontsize=11, fontweight="bold")
-
-    fig.tight_layout()
-    out = os.path.join(FIG_DIR, f"fig_{fname}.png")
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out}")
-
-print("All done.")
-
-# ---------------------------------------------------------------------------
-# Yearly trend figures: one figure per estimator (est1 / est2 / est3)
-# Each figure: 2 panels (CAR top, CAV bottom)
-# Each panel: 6 lines, one per window (pre 30min, pre 1hr, during 30min,
-#             during 1hr, post 30min, post 1hr)
-# ---------------------------------------------------------------------------
-WINDOW_STYLES = [
-    # (label,           car_col_template,                  cav_col_template,                  linestyle, marker)
-    ("pre 30min",    "car_before_start_30min_with925_{e}", "cav_before_start_30min_with925_{e}", "-",  "o"),
-    ("pre 1hr",      "car_before_start_1hr_with925_{e}",   "cav_before_start_1hr_with925_{e}",   "--", "o"),
-    ("during 30min", "car_after_start_30min_with925_{e}",  "cav_after_start_30min_with925_{e}",  "-",  "s"),
-    ("during 1hr",   "car_after_start_1hr_with925_{e}",    "cav_after_start_1hr_with925_{e}",    "--", "s"),
-    ("post 30min",   "car_after_end_30min_with925_{e}",    "cav_after_end_30min_with925_{e}",    "-",  "^"),
-    ("post 1hr",     "car_after_end_1hr_with925_{e}",      "cav_after_end_1hr_with925_{e}",      "--", "^"),
+GROUPS = [
+    ("all",       None,    "All roadshows"),
+    ("start_09",  "09:00", "Roadshow start 09:00"),
+    ("start_14",  "14:00", "Roadshow start 14:00"),
 ]
 
-WIN_COLORS = ["#4878CF", "#1F4E8C", "#E8851A", "#A85C00", "#4DAF52", "#2A7A2E"]
+for folder, start_filter, group_label in GROUPS:
+    fig_dir = os.path.join(FIG_DIR, folder)
+    os.makedirs(fig_dir, exist_ok=True)
 
-years = sorted(ipo["year"].unique())
+    ipo = ipo_base if start_filter is None else ipo_base[ipo_base["start_time"] == start_filter].copy()
+    print(f"\n[{group_label}]  n={len(ipo)}")
 
-print("Drawing yearly trend figures ...")
-for est in ["est1", "est2", "est3"]:
-    fig, (ax_car, ax_cav) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    fig.suptitle(
-        f"Yearly Trend of Rival-Firm Abnormal Return & Volume by Event Window\n"
-        f"({est.upper()}, with 9:25 auction, IPO-level mean across rivals)",
-        fontsize=12, fontweight="bold",
-    )
+    print(f"  Drawing window figures ...")
+    make_window_figs(ipo, fig_dir, group_label)
 
-    for (label, car_tmpl, cav_tmpl, ls, mk), clr in zip(WINDOW_STYLES, WIN_COLORS):
-        car_col = car_tmpl.format(e=est)
-        cav_col = cav_tmpl.format(e=est)
+    print(f"  Drawing yearly trend figures ...")
+    make_yearly_figs(ipo, fig_dir, group_label)
 
-        for ax, col, metric in [(ax_car, car_col, "CAR"), (ax_cav, cav_col, "CAV")]:
-            if col not in ipo.columns:
-                continue
-            yr_means = [ipo[ipo["year"] == y][col].mean() for y in years]
-            ax.plot(years, yr_means, linestyle=ls, marker=mk, color=clr,
-                    label=label, linewidth=1.6, markersize=5)
+    print(f"  Done → {fig_dir}  ({len(os.listdir(fig_dir))} files)")
 
-    for ax, metric in [(ax_car, "CAR"), (ax_cav, "CAV")]:
-        ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
-        ax.axvspan(2008.5, 2015.5, alpha=0.07, color="#4878CF", label="_Stage 1")
-        ax.axvspan(2015.5, 2024.5, alpha=0.07, color="#D65F5F", label="_Stage 2")
-        ax.set_ylabel(metric, fontsize=11)
-        ax.grid(axis="y", alpha=0.3)
-        ax.legend(fontsize=8, ncol=3, loc="upper right", framealpha=0.8)
-        # Stage labels
-        ax.text(2012, ax.get_ylim()[0], "Stage 1", ha="center",
-                fontsize=8, color="#2255AA", alpha=0.7)
-        ax.text(2020, ax.get_ylim()[0], "Stage 2", ha="center",
-                fontsize=8, color="#AA2222", alpha=0.7)
-
-    ax_cav.set_xticks(years)
-    ax_cav.set_xticklabels(years, rotation=45, fontsize=8)
-    ax_cav.set_xlabel("Year", fontsize=10)
-    ax_car.set_title("CAR — Cumulative Abnormal Return", fontsize=10, fontweight="bold")
-    ax_cav.set_title("CAV — Cumulative Abnormal Volume", fontsize=10, fontweight="bold")
-
-    fig.tight_layout()
-    out = os.path.join(FIG_DIR, f"fig_yearly_trend_{est}.png")
-    fig.savefig(out, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out}")
-
-print("All done.")
+print("\nAll done.")
