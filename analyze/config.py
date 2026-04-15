@@ -27,11 +27,13 @@ PLATFORM_LIST = ["全景", "上证", "中国证券网", "中证", "IR"]
 VIDEO_SUFFIX = "路演视频"               # e.g. 全景路演视频/
 AUDIO_SUFFIX = "路演音频"               # e.g. 全景路演音频/
 TRANS_SUFFIX = "路演转录_去幻觉"         # e.g. 全景路演转录_去幻觉/
+QA_SUFFIX    = "路演问答"               # e.g. 全景路演问答/
 
 # 平台聚合目录（无平台前缀）
 INDEX_VIDEO_DIR = DATA_ROOT / VIDEO_SUFFIX
 INDEX_AUDIO_DIR = DATA_ROOT / AUDIO_SUFFIX
 INDEX_TRANS_DIR = DATA_ROOT / TRANS_SUFFIX
+INDEX_QA_DIR    = DATA_ROOT / QA_SUFFIX    # output: one CSV per roadshow
 
 # ─── 输出目录 ────────────────────────────────────────────────────────
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
@@ -58,6 +60,11 @@ PCA_N_COMPONENTS = 1      # 取第一主成分作为 Pitch Factor
 
 # ─── 情绪词典目录（可选，放在 analyze/lexicons/） ─────────────────────
 LEXICON_DIR = Path(__file__).resolve().parent / "lexicons"
+
+
+def get_qa_dir(platform: str) -> Path:
+    """返回指定平台的问答目录路径。"""
+    return DATA_ROOT / f"{platform}{QA_SUFFIX}"
 
 
 def get_audio_dir(platform: str) -> Path:
