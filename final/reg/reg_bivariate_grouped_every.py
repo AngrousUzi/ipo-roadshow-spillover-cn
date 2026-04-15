@@ -14,6 +14,14 @@ Bivariate grouped regression — 3 session variants, peer-level Y:
     IND_FE              : industry fixed effects (requires IND_COL in controls CSV)
     MKT_MOD             : market moderation — adds ret_4w_sh000300 + X*mkt interaction
 
+  Moderation flags (--*-mod):
+    --comp-verbal-mod   : moderation by competition_ratio from verbal_sentiment.csv (session-specific)
+    --pros-verbal-mod   : moderation by prospect_ratio from verbal_sentiment.csv (session-specific)
+    --q-comp-qa-mod     : moderation by q_competition_ratio from qa_analysis.csv (IPO-level)
+    --a-comp-qa-mod     : moderation by a_competition_ratio from qa_analysis.csv (IPO-level)
+    --q-pros-qa-mod     : moderation by q_prospect_ratio from qa_analysis.csv (IPO-level)
+    --a-pros-qa-mod     : moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)
+
   Each run produces two regression columns per record:
     coef/se/tstat/pvalue/r2        — bivariate (+ active FEs)
     coef_ctrl/…/r2_ctrl            — with controls (+ active FEs)
@@ -23,6 +31,11 @@ Bivariate grouped regression — 3 session variants, peer-level Y:
     coef_interact / se_interact / tstat_interact / pvalue_interact
                                    — interaction X * mkt (bivariate spec)
     coef_interact_ctrl / …         — same in controlled spec
+  For each active moderation (--*-mod), also outputs per moderator {name}:
+    coef_x_mod_{name} / coef_mod_{name} / pval_mod_{name}
+    coef_interact_{name} / se_interact_{name} / tstat_interact_{name} / pvalue_interact_{name}
+    r2_mod_{name} / n_obs_mod_{name}
+    [same with _ctrl suffix for controlled spec]
   Clustered SE at ipo_id level.
 
 Outputs (suffix encodes active modes):
@@ -53,6 +66,21 @@ def _parse_args():
     p.add_argument("--ind-fe", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--mkt-mod",action=argparse.BooleanOptionalAction, default=False,
                    help="Add market moderation: ret_4w_sh000300 main effect + X*mkt interaction")
+    p.add_argument("--winsor", action=argparse.BooleanOptionalAction, default=True,
+                   help="Winsorize all continuous variables at [1%%, 99%%] (default: on)")
+    # ── Moderation flags ──────────────────────────────────────────────────────
+    p.add_argument("--comp-verbal-mod", action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by competition_ratio from verbal_sentiment.csv (session-specific)")
+    p.add_argument("--pros-verbal-mod", action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by prospect_ratio from verbal_sentiment.csv (session-specific)")
+    p.add_argument("--q-comp-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by q_competition_ratio from qa_analysis.csv (IPO-level)")
+    p.add_argument("--a-comp-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by a_competition_ratio from qa_analysis.csv (IPO-level)")
+    p.add_argument("--q-pros-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by q_prospect_ratio from qa_analysis.csv (IPO-level)")
+    p.add_argument("--a-pros-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)")
     return p.parse_args()
 
 _args = _parse_args()
@@ -69,6 +97,8 @@ IND_FE              = _args.ind_fe  # industry fixed effects
 IND_COL             = "csrc3"       # column for IND_FE (CSRC 3-digit industry code)
 MKT_MOD             = _args.mkt_mod # market moderation via ret_4w_sh000300
 MKT_COL             = "ret_4w_sh000300"  # market proxy for moderation
+WINSORIZE           = _args.winsor       # winsorize all continuous vars at [1 %, 99 %]
+WINSOR_BOUNDS       = (0.01, 0.99)
 
 RIVAL_CONTROL_1 = ["log_size", "bm", "roa", "leverage"]
 RIVAL_CONTROL_2 = ["age_listed", "age_estab"]
@@ -79,6 +109,27 @@ PAIR_CONTROL    = ["sim_mda"]
 
 # SE is always clustered at ipo_id level for peer-level data (no flag needed)
 
+# ── Moderation configuration ──────────────────────────────────────────────────
+# Verbal moderators (session-specific, sourced from verbal_sentiment.csv)
+# Prefixed as vmod_{col} after merging into the regression dataframe
+VERBAL_MOD_MAP = {
+    "comp_verbal": "competition_ratio",
+    "pros_verbal": "prospect_ratio",
+}
+# QA moderators (IPO-level, sourced from qa_analysis.csv)
+# Prefixed as qmod_{col} after merging into the regression dataframe
+QA_MOD_MAP = {
+    "q_comp_qa": "q_competition_ratio",
+    "a_comp_qa": "a_competition_ratio",
+    "q_pros_qa": "q_prospect_ratio",
+    "a_pros_qa": "a_prospect_ratio",
+}
+
+active_verbal_mods = {k: v for k, v in VERBAL_MOD_MAP.items()
+                      if getattr(_args, k + "_mod")}
+active_qa_mods     = {k: v for k, v in QA_MOD_MAP.items()
+                      if getattr(_args, k + "_mod")}
+
 _suffix_parts = []
 if USE_RIVAL_CONTROL_1: _suffix_parts.append("rc1")
 if USE_RIVAL_CONTROL_2: _suffix_parts.append("rc2")
@@ -88,6 +139,9 @@ if USE_PAIR_CONTROL:    _suffix_parts.append("pc")
 if YEAR_FE:             _suffix_parts.append("yfe")
 if IND_FE:              _suffix_parts.append("ife")
 if MKT_MOD:             _suffix_parts.append("mkt")
+if WINSORIZE:           _suffix_parts.append("w99")
+for k in active_verbal_mods: _suffix_parts.append(k)
+for k in active_qa_mods:     _suffix_parts.append(k)
 OUTPUT_SUFFIX = ("_" + "_".join(_suffix_parts)) if _suffix_parts else "_base"
 
 SESSION_推介 = "推介"
@@ -135,6 +189,26 @@ y_col_groups = {
     "after_end":   [c for c in car.columns if c.startswith("car_after_end_")],
 }
 print(f"Y groups: { {k: len(v) for k, v in y_col_groups.items()} }")
+
+# ── 1b. Load QA moderator data (IPO-level) ────────────────────────────────────
+if active_qa_mods:
+    qa_df = pd.read_csv(ROOT / "analyze/output/qa_analysis.csv")
+    qa_df["ipo_id"] = qa_df["index2009"]
+    qa_src_cols = list(active_qa_mods.values())
+    qa_src_cols_present = [c for c in qa_src_cols if c in qa_df.columns]
+    _missing_qa = [c for c in qa_src_cols if c not in qa_df.columns]
+    if _missing_qa:
+        print(f"  WARNING: QA mod columns not found, skipped: {_missing_qa}")
+        active_qa_mods = {k: v for k, v in active_qa_mods.items()
+                          if v in qa_src_cols_present}
+    if active_qa_mods:
+        qa_mod_df = (qa_df.groupby("ipo_id")[qa_src_cols_present]
+                     .first().reset_index())
+        qa_mod_df = qa_mod_df.rename(
+            columns={v: f"qmod_{v}" for v in qa_src_cols_present}
+        )
+        car = car.merge(qa_mod_df, on="ipo_id", how="left")
+        print(f"QA mods merged: {qa_src_cols_present}")
 
 # ── 2. Roadshow start time → group ───────────────────────────────────────────
 import os as _os
@@ -184,6 +258,22 @@ for name, rel in sources.items():
     session_variants["mean"][name]       = (agg_avg, xcols)
     print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
 
+# ── 3b. Build verbal moderator aggregations (per session, from verbal source) ─
+verbal_mod_aggs = {}
+if active_verbal_mods:
+    for sess_label in [SESSION_推介, SESSION_答谢, "mean"]:
+        v_agg, _ = session_variants[sess_label]["verbal"]
+        cols_need  = [c for c in active_verbal_mods.values() if c in v_agg.columns]
+        cols_miss  = [c for c in active_verbal_mods.values() if c not in v_agg.columns]
+        if cols_miss:
+            print(f"  WARNING: verbal mod cols missing in verbal source ({sess_label}): {cols_miss}")
+        if cols_need:
+            vmod = v_agg[["ipo_id"] + cols_need].copy()
+            vmod = vmod.rename(columns={c: f"vmod_{c}" for c in cols_need})
+            verbal_mod_aggs[sess_label] = vmod
+    print(f"Verbal mod aggregations ready for sessions: {list(verbal_mod_aggs.keys())}, "
+          f"cols: {list(active_verbal_mods.values())}")
+
 # ── 4. Merge CAR with group labels ───────────────────────────────────────────
 car_grp = car.merge(idx_sub, on="ipo_id", how="inner")
 print(f"\nPeer rows after group filter: {len(car_grp)} "
@@ -198,16 +288,47 @@ def finite_mask(arr):
     a = np.asarray(arr, dtype=float)
     return np.isfinite(a)
 
-def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols, mkt_mod=False, mkt_col=None):
+def winsorize(arr):
+    a = np.asarray(arr, dtype=float)
+    lo = np.nanpercentile(a, WINSOR_BOUNDS[0] * 100)
+    hi = np.nanpercentile(a, WINSOR_BOUNDS[1] * 100)
+    return np.clip(a, lo, hi)
+
+def maybe_winsorize(arr):
+    return winsorize(arr) if WINSORIZE else np.asarray(arr, dtype=float)
+
+def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
+                    mkt_mod=False, mkt_col=None,
+                    verbal_mods=None, qa_mods=None, verbal_mod_aggs=None):
+    """
+    Parameters
+    ----------
+    verbal_mods : dict {mod_name: original_col}, optional
+        Verbal moderators (session-specific). Their vmod_{col} columns are merged
+        per session from verbal_mod_aggs.
+    qa_mods : dict {mod_name: original_col}, optional
+        QA moderators (IPO-level). Their qmod_{col} columns are already in car_grp.
+    verbal_mod_aggs : dict {sess_label: DataFrame}, optional
+        Pre-built verbal mod aggregations keyed by session label.
+    """
     records = []
     for sess_label, src_dict in session_variants.items():
+        # Verbal mod DF for this session (merged into each source merge below)
+        vmod_df = None
+        if verbal_mods and verbal_mod_aggs:
+            vmod_df = verbal_mod_aggs.get(sess_label)
+
         for src, (x_df, x_cols) in src_dict.items():
             merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
+
+            # Attach verbal mods for this session (session-specific aggregation)
+            if vmod_df is not None:
+                merged = merged.merge(vmod_df, on="ipo_id", how="left")
+
             for grp in ("am", "pm"):
                 sub = merged[merged["group"] == grp].reset_index(drop=True)
 
                 # Build combined FE array once per (session, source, group)
-                # float32 to halve peak memory when slicing inside inner loop
                 fe_parts = []
                 for fc in fe_cols:
                     if fc in sub.columns:
@@ -220,12 +341,24 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols, mkt_m
                 # Market proxy array (used when mkt_mod=True)
                 mkt_arr_full = None
                 if mkt_mod and mkt_col and mkt_col in sub.columns:
-                    mkt_arr_full = sub[mkt_col].to_numpy(dtype=float, na_value=np.nan)
+                    mkt_arr_full = maybe_winsorize(sub[mkt_col].to_numpy(dtype=float, na_value=np.nan))
+
+                # Build moderator column list for this (session, src, grp)
+                # Each entry: (mod_name, col_in_sub)
+                all_mods_cfg = []
+                for mod_name, mod_col in (qa_mods or {}).items():
+                    col = f"qmod_{mod_col}"
+                    if col in sub.columns:
+                        all_mods_cfg.append((mod_name, col))
+                for mod_name, mod_col in (verbal_mods or {}).items():
+                    col = f"vmod_{mod_col}"
+                    if col in sub.columns:
+                        all_mods_cfg.append((mod_name, col))
 
                 for y_col in y_cols:
-                    y_arr = sub[y_col].to_numpy(dtype=float, na_value=np.nan)
+                    y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
                     for x_col in x_cols:
-                        x_arr = sub[x_col].to_numpy(dtype=float, na_value=np.nan)
+                        x_arr = maybe_winsorize(sub[x_col].to_numpy(dtype=float, na_value=np.nan))
 
                         base_ok = finite_mask(y_arr) & finite_mask(x_arr)
                         if mkt_mod and mkt_arr_full is not None:
@@ -244,6 +377,13 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols, mkt_m
                             "x_source": src,
                             "x_col":    x_col,
                         }
+
+                        # Pre-compute ctrl arrays (reused by base ctrl spec and mod ctrl specs)
+                        ctrl_arr = None
+                        if ctrl_cols:
+                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32)
+                            for j in range(ctrl_arr.shape[1]):
+                                ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
 
                         # ── Bivariate (± FE ± mkt moderation) ────────────
                         if mkt_mod and mkt_arr_full is not None:
@@ -282,9 +422,8 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols, mkt_m
                             rec["error_bi"] = str(e)
 
                         # ── With controls (± FE ± mkt moderation) ─────────
-                        if ctrl_cols:
-                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32)
-                            ctrl_ok  = base_ok.copy()
+                        if ctrl_arr is not None:
+                            ctrl_ok = base_ok.copy()
                             for j in range(ctrl_arr.shape[1]):
                                 ctrl_ok &= finite_mask(ctrl_arr[:, j])
 
@@ -342,6 +481,84 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols, mkt_m
                             else:
                                 rec["error_ctrl"] = "too few obs after ctrl dropna"
 
+                        # ── Additional moderations (competition / prospect) ─
+                        for mod_name, mod_col in all_mods_cfg:
+                            mod_arr_full = maybe_winsorize(
+                                sub[mod_col].to_numpy(dtype=float, na_value=np.nan)
+                            )
+                            mod_ok = base_ok & finite_mask(mod_arr_full)
+
+                            rec[f"n_obs_mod_{mod_name}"] = int(mod_ok.sum())
+                            if mod_ok.sum() < 15:
+                                continue
+
+                            y_m = y_arr[mod_ok]; x_m = x_arr[mod_ok]
+                            mval = mod_arr_full[mod_ok]
+                            interact_m = x_m * mval
+                            g_m = sub.loc[mod_ok, "ipo_id"].values
+
+                            core_m = np.column_stack([x_m, mval, interact_m])
+                            X_m = sm.add_constant(
+                                np.column_stack([core_m, fe_arr[mod_ok]])
+                                if fe_arr is not None else core_m
+                            )
+                            try:
+                                res_m = run_ols_clustered(y_m, X_m, g_m)
+                                rec.update({
+                                    f"n_ipo_mod_{mod_name}":          int(pd.Series(g_m).nunique()),
+                                    f"coef_x_mod_{mod_name}":         res_m.params[1],
+                                    f"coef_mod_{mod_name}":           res_m.params[2],
+                                    f"pval_mod_{mod_name}":           res_m.pvalues[2],
+                                    f"coef_interact_{mod_name}":      res_m.params[3],
+                                    f"se_interact_{mod_name}":        res_m.bse[3],
+                                    f"tstat_interact_{mod_name}":     res_m.tvalues[3],
+                                    f"pvalue_interact_{mod_name}":    res_m.pvalues[3],
+                                    f"r2_mod_{mod_name}":             res_m.rsquared,
+                                })
+                            except Exception as e:
+                                rec[f"error_mod_{mod_name}"] = str(e)
+
+                            # Moderated + controls spec
+                            if ctrl_arr is not None:
+                                ctrl_ok_m = mod_ok.copy()
+                                for j in range(ctrl_arr.shape[1]):
+                                    ctrl_ok_m &= finite_mask(ctrl_arr[:, j])
+
+                                rec[f"n_obs_mod_{mod_name}_ctrl"] = int(ctrl_ok_m.sum())
+                                if ctrl_ok_m.sum() >= 15:
+                                    y_mc   = y_arr[ctrl_ok_m]; x_mc = x_arr[ctrl_ok_m]
+                                    mval_c = mod_arr_full[ctrl_ok_m]
+                                    interact_mc = x_mc * mval_c
+                                    ctrlv_m = ctrl_arr[ctrl_ok_m]
+                                    g_mc    = sub.loc[ctrl_ok_m, "ipo_id"].values
+
+                                    core_mc = np.column_stack([x_mc, mval_c, interact_mc])
+                                    X_mc = sm.add_constant(
+                                        np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
+                                        if fe_arr is not None else
+                                        np.column_stack([core_mc, ctrlv_m])
+                                    )
+                                    try:
+                                        res_mc = run_ols_clustered(y_mc, X_mc, g_mc)
+                                        # param layout: const(0) X(1) MOD(2) X*MOD(3) controls(4+)
+                                        rec.update({
+                                            f"coef_x_mod_{mod_name}_ctrl":      res_mc.params[1],
+                                            f"coef_mod_{mod_name}_ctrl":        res_mc.params[2],
+                                            f"pval_mod_{mod_name}_ctrl":        res_mc.pvalues[2],
+                                            f"coef_interact_{mod_name}_ctrl":   res_mc.params[3],
+                                            f"se_interact_{mod_name}_ctrl":     res_mc.bse[3],
+                                            f"tstat_interact_{mod_name}_ctrl":  res_mc.tvalues[3],
+                                            f"pvalue_interact_{mod_name}_ctrl": res_mc.pvalues[3],
+                                            f"r2_mod_{mod_name}_ctrl":          res_mc.rsquared,
+                                        })
+                                        for i, cc in enumerate(ctrl_cols):
+                                            rec[f"coef_{cc}_mod_{mod_name}"] = res_mc.params[4 + i]
+                                            rec[f"pval_{cc}_mod_{mod_name}"] = res_mc.pvalues[4 + i]
+                                    except Exception as e:
+                                        rec[f"error_mod_{mod_name}_ctrl"] = str(e)
+                                else:
+                                    rec[f"error_mod_{mod_name}_ctrl"] = "too few obs after ctrl dropna"
+
                         records.append(rec)
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
@@ -379,6 +596,9 @@ for y_group, y_cols in y_col_groups.items():
     out = run_regressions(
         car_grp, y_cols, session_variants, ctrl_present, fe_cols,
         mkt_mod=MKT_MOD, mkt_col=MKT_COL,
+        verbal_mods=active_verbal_mods if active_verbal_mods else None,
+        qa_mods=active_qa_mods     if active_qa_mods     else None,
+        verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
     )
     out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
     out.to_csv(out_path, index=False, encoding="utf-8-sig")
