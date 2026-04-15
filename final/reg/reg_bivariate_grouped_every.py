@@ -138,7 +138,7 @@ print(f"Y groups: { {k: len(v) for k, v in y_col_groups.items()} }")
 
 # ── 2. Roadshow start time → group ───────────────────────────────────────────
 import os as _os
-_ann_dir = ROOT / "anns" if _os.name == "nt" else ROOT / "../cninf-ann-scraper"
+_ann_dir = ROOT / "anns" if _os.name == "nt" else ROOT / "../"
 idx = pd.read_excel(_ann_dir / "IPO_index.xlsx", usecols=["INDEX2009", "开始时间"])
 idx_sub = idx[["INDEX2009", "开始时间"]].copy()
 idx_sub.columns = ["ipo_id", "start_time"]
