@@ -381,7 +381,7 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                         # Pre-compute ctrl arrays (reused by base ctrl spec and mod ctrl specs)
                         ctrl_arr = None
                         if ctrl_cols:
-                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32)
+                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32).copy()
                             for j in range(ctrl_arr.shape[1]):
                                 ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
 

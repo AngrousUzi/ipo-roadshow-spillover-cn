@@ -242,7 +242,7 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
 
                         # ── With controls (± FE ± mkt moderation) ────────────
                         if ctrl_cols:
-                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=float)
+                            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=float).copy()
                             for j in range(ctrl_arr.shape[1]):
                                 ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
                             ctrl_ok = base_ok.copy()
