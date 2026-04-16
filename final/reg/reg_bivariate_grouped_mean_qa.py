@@ -117,9 +117,10 @@ print(f"IPO rows after group filter: {len(qa_grp)} "
 # ── 4. Load X features (verbal, vocal, visual) ───────────────────────────────
 META_X = {"file_stem", "method", "error"}
 sources = {
-    "verbal": "analyze/output/verbal_sentiment.csv",
-    "vocal":  "analyze/output/vocal_features.csv",
-    "visual": "analyze/output/visual_gaze.csv",
+    "verbal":     "analyze/output/verbal_sentiment.csv",
+    "vocal":      "analyze/output/vocal_features.csv",
+    "visual":     "analyze/output/visual_gaze.csv",
+    "visual_fer": "analyze/output/visual_fer.csv",
 }
 
 def load_agg(path, session_filter=None):

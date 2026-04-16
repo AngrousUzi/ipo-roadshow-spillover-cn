@@ -165,9 +165,10 @@ print(f"IPOs in index: am={grp_counts.get('am',0)}, pm={grp_counts.get('pm',0)}"
 # ── 3. Load X features ────────────────────────────────────────────────────────
 META = {"file_stem", "method", "error"}
 sources = {
-    "verbal": "analyze/output/verbal_sentiment.csv",
-    "vocal":  "analyze/output/vocal_features.csv",
-    "visual": "analyze/output/visual_gaze.csv",
+    "verbal":     "analyze/output/verbal_sentiment.csv",
+    "vocal":      "analyze/output/vocal_features.csv",
+    "visual":     "analyze/output/visual_gaze.csv",
+    "visual_fer": "analyze/output/visual_fer.csv",
 }
 
 def load_agg(path, session_filter=None):
