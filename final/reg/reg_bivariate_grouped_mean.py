@@ -185,20 +185,18 @@ def load_agg(path, session_filter=None):
     ]
     return df.groupby("ipo_id")[xcols].mean().reset_index(), xcols
 
-session_variants = {SESSION_推介: {}, SESSION_答谢: {}, "mean": {}}
+session_variants = {SESSION_推介: {}, SESSION_答谢: {}}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
     agg_da,  _     = load_agg(ROOT / rel, session_filter=SESSION_答谢)
-    agg_avg, _     = load_agg(ROOT / rel, session_filter=None)
     session_variants[SESSION_推介][name] = (agg_tui, xcols)
     session_variants[SESSION_答谢][name] = (agg_da,  xcols)
-    session_variants["mean"][name]       = (agg_avg, xcols)
-    print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
+    print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, {len(xcols)} X cols")
 
 # ── 3b. Build verbal moderator aggregations (per session, from verbal source) ─
 verbal_mod_aggs = {}
 if active_verbal_mods:
-    for sess_label in [SESSION_推介, SESSION_答谢, "mean"]:
+    for sess_label in [SESSION_推介, SESSION_答谢]:
         v_agg, _ = session_variants[sess_label]["verbal"]
         cols_need = [c for c in active_verbal_mods.values() if c in v_agg.columns]
         cols_miss = [c for c in active_verbal_mods.values() if c not in v_agg.columns]
@@ -521,7 +519,7 @@ def summarise(out, label, ctrl_cols, use_fe):
     fe_tag = "+FE" if use_fe else ""
     res_ok = out[out["pvalue"].notna()].copy()
     print(f"\n[{label}] Completed: {len(res_ok)}  SE: HC3")
-    for sess in (SESSION_推介, SESSION_答谢, "mean"):
+    for sess in (SESSION_推介, SESSION_答谢):
         sub = res_ok[res_ok["session"] == sess]
         print(f"  {sess:4s} (bivariate{fe_tag}): "
               f"p<0.01={(sub.pvalue<0.01).sum()}, "
