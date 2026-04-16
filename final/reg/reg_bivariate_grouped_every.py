@@ -297,6 +297,27 @@ def winsorize(arr):
 def maybe_winsorize(arr):
     return winsorize(arr) if WINSORIZE else np.asarray(arr, dtype=float)
 
+def _drop_const_cols(mat):
+    """Return (cleaned_mat, kept_bool_mask) — removes zero-variance columns."""
+    keep = np.std(mat, axis=0) > 0
+    return mat[:, keep], keep
+
+def safe_add_constant(mat):
+    """Prepend intercept after dropping zero-variance columns.
+
+    statsmodels' add_constant silently skips adding the intercept when it
+    detects an existing zero-variance column (e.g. a winsorised control that
+    collapsed to a constant in a subgroup), shifting all param indices by -1.
+    This helper avoids that by dropping such columns first and prepending
+    ones explicitly.
+
+    Returns (X_mat, kept_mask) where kept_mask is a boolean array over the
+    *input* columns (before the prepended intercept).
+    """
+    clean, keep = _drop_const_cols(mat)
+    X = np.column_stack([np.ones((clean.shape[0], 1)), clean])
+    return X, keep
+
 def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                     mkt_mod=False, mkt_col=None,
                     verbal_mods=None, qa_mods=None, verbal_mod_aggs=None):
@@ -394,9 +415,9 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                             core_bi = x_b.reshape(-1, 1)
 
                         if fe_arr is not None:
-                            X_bi = sm.add_constant(np.column_stack([core_bi, fe_arr[base_ok]]))
+                            X_bi, _ = safe_add_constant(np.column_stack([core_bi, fe_arr[base_ok]]))
                         else:
-                            X_bi = sm.add_constant(core_bi)
+                            X_bi, _ = safe_add_constant(core_bi)
                         try:
                             res_bi = run_ols_clustered(y_b, X_bi, g_b)
                             rec.update({
@@ -443,14 +464,13 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                                 else:
                                     core_ct = x_c2.reshape(-1, 1)
 
+                                _n_core_ct = core_ct.shape[1]
                                 if fe_arr is not None:
-                                    X_ctrl = sm.add_constant(
-                                        np.column_stack([core_ct, ctrlv, fe_arr[ctrl_ok]])
-                                    )
+                                    _inner_ct = np.column_stack([core_ct, ctrlv, fe_arr[ctrl_ok]])
                                 else:
-                                    X_ctrl = sm.add_constant(
-                                        np.column_stack([core_ct, ctrlv])
-                                    )
+                                    _inner_ct = np.column_stack([core_ct, ctrlv])
+                                X_ctrl, _keep_ct = safe_add_constant(_inner_ct)
+                                _ctrl_keep_ct = _keep_ct[_n_core_ct : _n_core_ct + len(ctrl_cols)]
                                 try:
                                     res_ct = run_ols_clustered(y_c2, X_ctrl, g_c2)
                                     rec.update({
@@ -473,9 +493,12 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                                         })
                                     else:
                                         ctrl_offset = 2
+                                    _kept_i_ct = 0
                                     for i, cc in enumerate(ctrl_cols):
-                                        rec[f"coef_{cc}"] = res_ct.params[ctrl_offset + i]
-                                        rec[f"pval_{cc}"] = res_ct.pvalues[ctrl_offset + i]
+                                        if _ctrl_keep_ct[i]:
+                                            rec[f"coef_{cc}"] = res_ct.params[ctrl_offset + _kept_i_ct]
+                                            rec[f"pval_{cc}"] = res_ct.pvalues[ctrl_offset + _kept_i_ct]
+                                            _kept_i_ct += 1
                                 except Exception as e:
                                     rec["error_ctrl"] = str(e)
                             else:
@@ -498,7 +521,7 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                             g_m = sub.loc[mod_ok, "ipo_id"].values
 
                             core_m = np.column_stack([x_m, mval, interact_m])
-                            X_m = sm.add_constant(
+                            X_m, _ = safe_add_constant(
                                 np.column_stack([core_m, fe_arr[mod_ok]])
                                 if fe_arr is not None else core_m
                             )
@@ -533,11 +556,13 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                                     g_mc    = sub.loc[ctrl_ok_m, "ipo_id"].values
 
                                     core_mc = np.column_stack([x_mc, mval_c, interact_mc])
-                                    X_mc = sm.add_constant(
-                                        np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
-                                        if fe_arr is not None else
-                                        np.column_stack([core_mc, ctrlv_m])
-                                    )
+                                    _n_core_mc = core_mc.shape[1]
+                                    if fe_arr is not None:
+                                        _inner_mc = np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
+                                    else:
+                                        _inner_mc = np.column_stack([core_mc, ctrlv_m])
+                                    X_mc, _keep_mc = safe_add_constant(_inner_mc)
+                                    _ctrl_keep_mc = _keep_mc[_n_core_mc : _n_core_mc + len(ctrl_cols)]
                                     try:
                                         res_mc = run_ols_clustered(y_mc, X_mc, g_mc)
                                         # param layout: const(0) X(1) MOD(2) X*MOD(3) controls(4+)
@@ -551,9 +576,12 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                                             f"pvalue_interact_{mod_name}_ctrl": res_mc.pvalues[3],
                                             f"r2_mod_{mod_name}_ctrl":          res_mc.rsquared,
                                         })
+                                        _kept_i_mc = 0
                                         for i, cc in enumerate(ctrl_cols):
-                                            rec[f"coef_{cc}_mod_{mod_name}"] = res_mc.params[4 + i]
-                                            rec[f"pval_{cc}_mod_{mod_name}"] = res_mc.pvalues[4 + i]
+                                            if _ctrl_keep_mc[i]:
+                                                rec[f"coef_{cc}_mod_{mod_name}"] = res_mc.params[4 + _kept_i_mc]
+                                                rec[f"pval_{cc}_mod_{mod_name}"] = res_mc.pvalues[4 + _kept_i_mc]
+                                                _kept_i_mc += 1
                                     except Exception as e:
                                         rec[f"error_mod_{mod_name}_ctrl"] = str(e)
                                 else:

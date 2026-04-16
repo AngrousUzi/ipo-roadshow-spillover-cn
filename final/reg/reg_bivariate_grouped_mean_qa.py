@@ -160,6 +160,28 @@ def maybe_winsorize(arr):
     hi = np.nanpercentile(a, WINSOR_BOUNDS[1] * 100)
     return np.clip(a, lo, hi)
 
+def _drop_const_cols(mat):
+    """Return (cleaned_mat, kept_bool_mask) — removes zero-variance columns."""
+    keep = np.std(mat, axis=0) > 0
+    return mat[:, keep], keep
+
+def safe_add_constant(mat):
+    """Prepend intercept after dropping zero-variance columns.
+
+    statsmodels' add_constant silently skips adding the intercept when it
+    detects an existing zero-variance column (e.g. a winsorised control that
+    collapsed to a constant in a subgroup).  This shifts all param indices by
+    -1, causing coef_ctrl to silently report a *control* coefficient instead
+    of the X coefficient.  This helper avoids that by dropping such columns
+    first and prepending ones explicitly.
+
+    Returns (X_mat, kept_mask) where kept_mask is a boolean array over the
+    *input* columns (before the prepended intercept).
+    """
+    clean, keep = _drop_const_cols(mat)
+    X = np.column_stack([np.ones((clean.shape[0], 1)), clean])
+    return X, keep
+
 def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
                     mkt_mod=False, mkt_col=None):
     records = []
@@ -214,9 +236,9 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
                             core_bi = x_b.reshape(-1, 1)
 
                         if use_fe and yr_arr is not None:
-                            X_bi = sm.add_constant(np.column_stack([core_bi, yr_arr[base_ok]]))
+                            X_bi, _ = safe_add_constant(np.column_stack([core_bi, yr_arr[base_ok]]))
                         else:
-                            X_bi = sm.add_constant(core_bi)
+                            X_bi, _ = safe_add_constant(core_bi)
                         try:
                             res_bi = run_ols_hc3(y_b, X_bi)
                             rec.update({
@@ -266,11 +288,11 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
                                     ctrl_offset = 2
 
                                 if use_fe and yr_arr is not None:
-                                    X_ctrl = sm.add_constant(
+                                    X_ctrl, keep_c = safe_add_constant(
                                         np.column_stack([core_ct, ctrlv, yr_arr[ctrl_ok]])
                                     )
                                 else:
-                                    X_ctrl = sm.add_constant(np.column_stack([core_ct, ctrlv]))
+                                    X_ctrl, keep_c = safe_add_constant(np.column_stack([core_ct, ctrlv]))
                                 try:
                                     res_ct = run_ols_hc3(y_c2, X_ctrl)
                                     rec.update({
@@ -289,9 +311,22 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
                                             "tstat_interact_ctrl":  res_ct.tvalues[3],
                                             "pvalue_interact_ctrl": res_ct.pvalues[3],
                                         })
+                                    
+                                    # control params are after core_ct variables
+                                    # We use the keep_c mask to check which control variables survived dropping.
+                                    # The core_ct variables have indices 0 to ctrl_offset-1 in the original matrix (without constant).
+                                    c_keep = keep_c[ctrl_offset - 1 : ctrl_offset - 1 + len(ctrl_cols)]
+                                    
+                                    out_idx = ctrl_offset
                                     for i, cc in enumerate(ctrl_cols):
-                                        rec[f"coef_{cc}"] = res_ct.params[ctrl_offset + i]
-                                        rec[f"pval_{cc}"] = res_ct.pvalues[ctrl_offset + i]
+                                        if c_keep[i]:
+                                            rec[f"coef_{cc}"] = res_ct.params[out_idx]
+                                            rec[f"pval_{cc}"] = res_ct.pvalues[out_idx]
+                                            out_idx += 1
+                                        else:
+                                            rec[f"coef_{cc}"] = np.nan
+                                            rec[f"pval_{cc}"] = np.nan
+                                            
                                 except Exception as e:
                                     rec["error_ctrl"] = str(e)
                             else:
