@@ -32,6 +32,8 @@ def _parse_args():
     p = argparse.ArgumentParser(description="Bivariate grouped regression — QA outcomes")
     p.add_argument("--mkt-mod", action=argparse.BooleanOptionalAction, default=False,
                    help="Add market moderation: ret_4w_sh000300 + X*mkt interaction")
+    p.add_argument("--pca",    action=argparse.BooleanOptionalAction, default=False,
+                   help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
     return p.parse_args()
 
 _args = _parse_args()
@@ -46,9 +48,12 @@ WINSORIZE     = True
 WINSOR_BOUNDS = (0.01, 0.99)
 MKT_MOD       = _args.mkt_mod
 MKT_COL       = "ret_4w_sh000300"
+PCA_MODE      = _args.pca
 
 SESSION_推介 = "推介"
 SESSION_答谢 = "答谢"
+
+_active_sessions = [SESSION_推介] if PCA_MODE else [SESSION_推介, SESSION_答谢, "mean"]
 
 # ── 1. Load QA analysis → Y variables (IPO-level mean) ───────────────────────
 qa_raw = pd.read_csv(ROOT / "analyze/output/qa_analysis.csv")
@@ -122,6 +127,8 @@ sources = {
     "visual":     "analyze/output/visual_gaze.csv",
     "visual_fer": "analyze/output/visual_fer.csv",
 }
+if PCA_MODE:
+    sources = {"pca": "final/pca/pca_scores_combined_tui.csv"}
 
 def load_agg(path, session_filter=None):
     df = pd.read_csv(path)
@@ -138,15 +145,18 @@ def load_agg(path, session_filter=None):
     ]
     return df.groupby("ipo_id")[xcols].mean().reset_index(), xcols
 
-session_variants = {SESSION_推介: {}, SESSION_答谢: {}, "mean": {}}
+session_variants = {s: {} for s in _active_sessions}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
-    agg_da,  _     = load_agg(ROOT / rel, session_filter=SESSION_答谢)
-    agg_avg, _     = load_agg(ROOT / rel, session_filter=None)
     session_variants[SESSION_推介][name] = (agg_tui, xcols)
-    session_variants[SESSION_答谢][name] = (agg_da,  xcols)
-    session_variants["mean"][name]       = (agg_avg, xcols)
-    print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
+    if not PCA_MODE:
+        agg_da,  _ = load_agg(ROOT / rel, session_filter=SESSION_答谢)
+        agg_avg, _ = load_agg(ROOT / rel, session_filter=None)
+        session_variants[SESSION_答谢][name] = (agg_da,  xcols)
+        session_variants["mean"][name]       = (agg_avg, xcols)
+        print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
+    else:
+        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
 
 # ── 5. Regression engine ──────────────────────────────────────────────────────
 def run_ols_hc3(y_c, X_mat):
@@ -337,11 +347,113 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
 
+def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe):
+    """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs)."""
+    records = []
+    merged = qa_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
+
+    for grp in ("am", "pm"):
+        sub = merged[merged["group"] == grp].reset_index(drop=True)
+
+        yr_arr = None
+        if use_fe and "event_year" in sub.columns:
+            yr_dum = pd.get_dummies(sub["event_year"], prefix="yr", drop_first=True).astype(float)
+            yr_arr = yr_dum.values
+
+        ctrl_arr = None
+        if ctrl_cols:
+            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=float).copy()
+            for j in range(ctrl_arr.shape[1]):
+                ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+        for y_col in y_cols:
+            y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+            X_all = np.column_stack([
+                maybe_winsorize(sub[pc].to_numpy(dtype=float, na_value=np.nan))
+                for pc in pc_cols
+            ])
+
+            for n in range(1, len(pc_cols) + 1):
+                x_subset = pc_cols[:n]
+                X_n = X_all[:, :n]
+
+                base_ok = finite_mask(y_arr)
+                for j in range(n):
+                    base_ok &= finite_mask(X_n[:, j])
+                if base_ok.sum() < 15:
+                    continue
+
+                y_b = y_arr[base_ok]
+                X_b = X_n[base_ok] if n > 1 else X_n[base_ok].reshape(-1, 1)
+
+                rec = {
+                    "group":           grp,
+                    "y_col":           y_col,
+                    "n_pcs":           n,
+                    "x_cols_included": ",".join(x_subset),
+                }
+
+                core = X_b
+                if use_fe and yr_arr is not None:
+                    X_bi, _ = safe_add_constant(np.column_stack([core, yr_arr[base_ok]]))
+                else:
+                    X_bi, _ = safe_add_constant(core)
+                try:
+                    res_bi = run_ols_hc3(y_b, X_bi)
+                    rec["n_obs"] = int(base_ok.sum())
+                    rec["r2"]    = res_bi.rsquared
+                    for i, pc in enumerate(x_subset):
+                        rec[f"coef_{pc}"]   = res_bi.params[1 + i]
+                        rec[f"se_{pc}"]     = res_bi.bse[1 + i]
+                        rec[f"tstat_{pc}"]  = res_bi.tvalues[1 + i]
+                        rec[f"pvalue_{pc}"] = res_bi.pvalues[1 + i]
+                except Exception as e:
+                    rec["error_bi"] = str(e)
+
+                if ctrl_arr is not None:
+                    ctrl_ok = base_ok.copy()
+                    for j in range(ctrl_arr.shape[1]):
+                        ctrl_ok &= finite_mask(ctrl_arr[:, j])
+                    rec["n_obs_ctrl"] = int(ctrl_ok.sum())
+                    if ctrl_ok.sum() >= 15:
+                        y_c   = y_arr[ctrl_ok]
+                        X_c   = X_n[ctrl_ok] if n > 1 else X_n[ctrl_ok].reshape(-1, 1)
+                        ctrlv = ctrl_arr[ctrl_ok]
+                        if use_fe and yr_arr is not None:
+                            _inner = np.column_stack([X_c, ctrlv, yr_arr[ctrl_ok]])
+                        else:
+                            _inner = np.column_stack([X_c, ctrlv])
+                        X_ctrl, _keep = safe_add_constant(_inner)
+                        _ctrl_keep = _keep[n: n + len(ctrl_cols)]
+                        try:
+                            res_ct = run_ols_hc3(y_c, X_ctrl)
+                            rec["r2_ctrl"] = res_ct.rsquared
+                            for i, pc in enumerate(x_subset):
+                                rec[f"coef_{pc}_ctrl"]   = res_ct.params[1 + i]
+                                rec[f"se_{pc}_ctrl"]     = res_ct.bse[1 + i]
+                                rec[f"tstat_{pc}_ctrl"]  = res_ct.tvalues[1 + i]
+                                rec[f"pvalue_{pc}_ctrl"] = res_ct.pvalues[1 + i]
+                            _kept_i = 0
+                            for j, cc in enumerate(ctrl_cols):
+                                if _ctrl_keep[j]:
+                                    rec[f"coef_{cc}_ctrl"] = res_ct.params[1 + n + _kept_i]
+                                    rec[f"pval_{cc}_ctrl"] = res_ct.pvalues[1 + n + _kept_i]
+                                    _kept_i += 1
+                        except Exception as e:
+                            rec["error_ctrl"] = str(e)
+                    else:
+                        rec["error_ctrl"] = "too few obs after ctrl dropna"
+
+                records.append(rec)
+        print(f"  group='{grp}' done")
+    return pd.DataFrame(records)
+
+
 def summarise(out, ctrl_cols, use_fe):
     fe_tag = "+FE" if use_fe else ""
     res_ok = out[out["pvalue"].notna()].copy()
     print(f"\nCompleted: {len(res_ok)}  SE: HC3")
-    for sess in (SESSION_推介, SESSION_答谢, "mean"):
+    for sess in _active_sessions:
         sub = res_ok[res_ok["session"] == sess]
         print(f"  {sess:4s} (bivariate{fe_tag}): "
               f"p<0.01={(sub.pvalue<0.01).sum()}, "
@@ -357,9 +469,14 @@ def summarise(out, ctrl_cols, use_fe):
 # ── 6. Run & save ─────────────────────────────────────────────────────────────
 print(f"\n=== Running QA regression ({len(y_candidates)} Y cols) ===")
 _mkt_suffix = "_mkt" if MKT_MOD else ""
-out = run_regressions(qa_grp, y_candidates, session_variants, ctrl_present, USE_FE,
-                      mkt_mod=MKT_MOD, mkt_col=MKT_COL)
-out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_mkt_suffix}.csv"
+_pca_suffix = "_pca" if PCA_MODE else ""
+out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_mkt_suffix}{_pca_suffix}.csv"
+if PCA_MODE:
+    _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+    out = run_regressions_pca(qa_grp, y_candidates, _x_df, _pc_cols, ctrl_present, USE_FE)
+else:
+    out = run_regressions(qa_grp, y_candidates, session_variants, ctrl_present, USE_FE,
+                          mkt_mod=MKT_MOD, mkt_col=MKT_COL)
+    summarise(out, ctrl_present, USE_FE)
 out.to_csv(out_path, index=False, encoding="utf-8-sig")
 print(f"Saved {len(out)} rows → {out_path}")
-summarise(out, ctrl_present, USE_FE)
