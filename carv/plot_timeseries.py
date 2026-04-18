@@ -28,16 +28,17 @@ CARV_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = CARV_DIR / "output"
 ANN_DIR    = CARV_DIR.parent / "anns"
 
-INPUT_FILE = OUTPUT_DIR / "ar_av_results.csv"
-INDEX_PATH = ANN_DIR / "IPO_index.xlsx"
-OUT_PLOT   = OUTPUT_DIR / "car_timeseries.png"
+INPUT_FILE      = OUTPUT_DIR / "ar_av_results.csv"
+INDEX_PATH      = ANN_DIR / "IPO_index.xlsx"
+OUT_PLOT        = OUTPUT_DIR / "car_timeseries.png"
+OUT_CSV_PERIOD  = OUTPUT_DIR / "car_timeseries_period_avg.csv"
+OUT_CSV_YEAR    = OUTPUT_DIR / "car_timeseries_year_avg.csv"
 
 AR_COLS = ["ar_est1", "ar_est2", "ar_est3"]
 
-# Bar window around t=0 (1 bar = 5 trading minutes)
-# Prev-day close to today open ≈ 78 bars (prev day) + 0 for 9am / ~38 for 2pm
-BARS_BEFORE = 90   # includes full previous trading day for both start types
-BARS_AFTER  = 90
+# ±40 bars = ±200 trading minutes around roadshow start
+BARS_BEFORE = 40
+BARS_AFTER  = 40
 
 
 # ── Data loading ──────────────────────────────────────────────────
@@ -179,15 +180,16 @@ PERIOD_COLORS = {"2009–2015": "steelblue", "2016–2024": "tomato"}
 # 2pm start  → bar 0 = 14:00.  Close = bar +13 (15:00).  Next-day open = bar +14.
 
 SESSION_LINES = {
-    # vertical lines at approximate bar indices of known trading events
+    # vertical lines at approximate bar indices of known session events
+    # 9am: prev-day close is ~51 bars back; within ±40 window only "start" is visible
     "9am": [
-        (-78,  "prev close"),   # ≈ prev-day 15:00 (78 bars of a full trading day before)
-        ( 0,   "start"),
+        (0, "start"),
     ],
+    # 2pm: today open ≈ bar -38 (9:25→14:00 = 38 bars); close ≈ bar +13 (14:00→15:00)
     "2pm": [
-        (-38,  "open"),         # ≈ today 9:25 (38 bars before 14:00)
-        ( 0,   "start"),
-        (+13,  "close"),        # ≈ today 15:00
+        (-38, "open"),
+        (  0, "start"),
+        ( 13, "close"),
     ],
 }
 
@@ -267,6 +269,12 @@ def main():
 
     print("Building period & yearly averages...")
     period_avg, year_avg = build_averages(ev)
+
+    print("Saving CSVs...")
+    period_avg.to_csv(OUT_CSV_PERIOD, index=False, encoding="utf-8-sig")
+    year_avg.to_csv(OUT_CSV_YEAR,   index=False, encoding="utf-8-sig")
+    print(f"  → {OUT_CSV_PERIOD}  ({len(period_avg):,} rows)")
+    print(f"  → {OUT_CSV_YEAR}  ({len(year_avg):,} rows)")
 
     print("Plotting...")
     plot(period_avg, year_avg, OUT_PLOT)
