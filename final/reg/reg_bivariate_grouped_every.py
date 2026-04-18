@@ -21,6 +21,7 @@ Bivariate grouped regression — 3 session variants, peer-level Y:
     --a-comp-qa-mod     : moderation by a_competition_ratio from qa_analysis.csv (IPO-level)
     --q-pros-qa-mod     : moderation by q_prospect_ratio from qa_analysis.csv (IPO-level)
     --a-pros-qa-mod     : moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)
+    --qa-pairs-mod      : moderation by qa_pairs (Q&A count) from qa_analysis.csv (IPO-level)
 
   Each run produces two regression columns per record:
     coef/se/tstat/pvalue/r2        — bivariate (+ active FEs)
@@ -86,6 +87,8 @@ def _parse_args():
                    help="Moderation by q_prospect_ratio from qa_analysis.csv (IPO-level)")
     p.add_argument("--a-pros-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
                    help="Moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)")
+    p.add_argument("--qa-pairs-mod",    action=argparse.BooleanOptionalAction, default=False,
+                   help="Moderation by qa_pairs (Q&A count) from qa_analysis.csv (IPO-level)")
     p.add_argument("--pca",             action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
     return p.parse_args()
@@ -133,6 +136,7 @@ QA_MOD_MAP = {
     "a_comp_qa": "a_competition_ratio",
     "q_pros_qa": "q_prospect_ratio",
     "a_pros_qa": "a_prospect_ratio",
+    "qa_pairs":  "qa_pairs",
 }
 
 active_verbal_mods = {k: v for k, v in VERBAL_MOD_MAP.items()
