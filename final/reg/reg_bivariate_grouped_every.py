@@ -68,6 +68,9 @@ def _parse_args():
                    help="Add market moderation: ret_4w_sh000300 main effect + X*mkt interaction")
     p.add_argument("--winsor", action=argparse.BooleanOptionalAction, default=True,
                    help="Winsorize all continuous variables at [1%%, 99%%] (default: on)")
+    p.add_argument("--top-rivals", type=int, default=None,
+                   help="Keep only top-N rivals per IPO by sim_mda similarity; "
+                        "drop IPO samples that have fewer than N rivals (e.g. 1, 3, 5)")
     # ── Moderation flags ──────────────────────────────────────────────────────
     p.add_argument("--comp-verbal-mod", action=argparse.BooleanOptionalAction, default=False,
                    help="Moderation by competition_ratio from verbal_sentiment.csv (session-specific)")
@@ -81,6 +84,8 @@ def _parse_args():
                    help="Moderation by q_prospect_ratio from qa_analysis.csv (IPO-level)")
     p.add_argument("--a-pros-qa-mod",   action=argparse.BooleanOptionalAction, default=False,
                    help="Moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)")
+    p.add_argument("--pca",             action=argparse.BooleanOptionalAction, default=False,
+                   help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
     return p.parse_args()
 
 _args = _parse_args()
@@ -99,6 +104,8 @@ MKT_MOD             = _args.mkt_mod # market moderation via ret_4w_sh000300
 MKT_COL             = "ret_4w_sh000300"  # market proxy for moderation
 WINSORIZE           = _args.winsor       # winsorize all continuous vars at [1 %, 99 %]
 WINSOR_BOUNDS       = (0.01, 0.99)
+TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim_mda (None = all)
+PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
 
 RIVAL_CONTROL_1 = ["log_size", "bm", "roa", "leverage"]
 RIVAL_CONTROL_2 = ["age_listed", "age_estab"]
@@ -140,6 +147,8 @@ if YEAR_FE:             _suffix_parts.append("yfe")
 if IND_FE:              _suffix_parts.append("ife")
 if MKT_MOD:             _suffix_parts.append("mkt")
 if WINSORIZE:           _suffix_parts.append("w99")
+if TOP_RIVALS is not None: _suffix_parts.append(f"top{TOP_RIVALS}")
+if PCA_MODE:            _suffix_parts.append("pca")
 for k in active_verbal_mods: _suffix_parts.append(k)
 for k in active_qa_mods:     _suffix_parts.append(k)
 OUTPUT_SUFFIX = ("_" + "_".join(_suffix_parts)) if _suffix_parts else "_base"
@@ -149,6 +158,18 @@ SESSION_答谢 = "答谢"
 
 # ── 1. Load CARV peer-level data ──────────────────────────────────────────────
 _raw = pd.read_csv(ROOT / "carv/output/car_cav_windows_controls.csv")
+
+# ── 1a. Top-N rivals filter (by sim_mda similarity) ──────────────────────────
+if TOP_RIVALS is not None:
+    if "sim_mda" not in _raw.columns:
+        raise ValueError("--top-rivals requires 'sim_mda' column in car_cav_windows_controls.csv")
+    _raw = _raw.sort_values("sim_mda", ascending=False)
+    _raw = _raw.groupby("ipo_id", group_keys=False).head(TOP_RIVALS)
+    _rival_counts = _raw.groupby("ipo_id").size()
+    _valid_ipos   = _rival_counts[_rival_counts >= TOP_RIVALS].index
+    _raw = _raw[_raw["ipo_id"].isin(_valid_ipos)].reset_index(drop=True)
+    print(f"Top-{TOP_RIVALS} rivals filter: {len(_raw)} peer-rows, "
+          f"{_raw['ipo_id'].nunique()} IPOs retained")
 
 # Assemble active control columns
 _want_ctrl = []
@@ -233,6 +254,9 @@ sources = {
     "visual":     "analyze/output/visual_gaze.csv",
     "visual_fer": "analyze/output/visual_fer.csv",
 }
+# When --pca, replace sources with pre-computed 推介 PCA scores (one file, all groups)
+if PCA_MODE:
+    sources = {"pca": "final/pca/pca_scores_推介.csv"}
 
 def load_agg(path, session_filter=None):
     df = pd.read_csv(path)
@@ -249,13 +273,18 @@ def load_agg(path, session_filter=None):
     ]
     return df.groupby("ipo_id")[xcols].mean().reset_index(), xcols
 
-session_variants = {SESSION_推介: {}, SESSION_答谢: {}}
+# When --pca, only 推介 session is available (PCA was fit on 推介 only)
+_active_sessions = [SESSION_推介] if PCA_MODE else [SESSION_推介, SESSION_答谢]
+session_variants = {s: {} for s in _active_sessions}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
-    agg_da,  _     = load_agg(ROOT / rel, session_filter=SESSION_答谢)
     session_variants[SESSION_推介][name] = (agg_tui, xcols)
-    session_variants[SESSION_答谢][name] = (agg_da,  xcols)
-    print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, {len(xcols)} X cols")
+    if not PCA_MODE:
+        agg_da, _ = load_agg(ROOT / rel, session_filter=SESSION_答谢)
+        session_variants[SESSION_答谢][name] = (agg_da, xcols)
+        print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, {len(xcols)} X cols")
+    else:
+        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
 
 # ── 3b. Build verbal moderator aggregations (per session, from verbal source) ─
 verbal_mod_aggs = {}
