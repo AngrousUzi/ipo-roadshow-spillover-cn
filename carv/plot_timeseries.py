@@ -73,12 +73,17 @@ def load_index() -> pd.DataFrame:
 def build_top_rivals_set(top_n: int) -> set:
     """
     Return a set of (ipo_id, rival_fc) pairs keeping only the top-N rivals
-    per IPO (per year) ranked by sim_mda descending.
+    per IPO ranked by sim_mda descending within the same csrc3 industry.
+
+    Stkcd in IPO_index.xlsx is numeric in Excel, so read without dtype=str
+    then cast float→int→str to avoid "1391.0"-style strings.
+    sim_mda is aggregated to max across years so each rival appears once.
     """
     idx_xl = pd.read_excel(INDEX_PATH, usecols=["Stkcd", "INDEX2009"], dtype=str)
-    idx_xl.columns = ["stkcd_ipo", "ipo_id"]
+    idx_xl = idx_xl.rename(columns={"Stkcd": "stkcd_ipo", "INDEX2009": "ipo_id"})
+    idx_xl = idx_xl.dropna(subset=["stkcd_ipo", "ipo_id"])
     idx_xl["stkcd_ipo"] = idx_xl["stkcd_ipo"].str.zfill(6)
-    idx_xl = idx_xl.dropna(subset=["stkcd_ipo", "ipo_id"]).drop_duplicates("ipo_id")
+    idx_xl = idx_xl.drop_duplicates("ipo_id")
 
     tfidf = pd.read_csv(TFIDF_PATH)
     tfidf["stkcd_i"] = tfidf["stkcd_i"].astype(str).str.zfill(6)
@@ -86,15 +91,18 @@ def build_top_rivals_set(top_n: int) -> set:
 
     merged = tfidf.merge(idx_xl, left_on="stkcd_i", right_on="stkcd_ipo", how="inner")
 
+    # Max sim_mda across years for each (ipo_id, csrc3, rival) → unique rivals
+    best_sim = (
+        merged.groupby(["ipo_id", "csrc3", "stkcd_j"], sort=False)["sim_mda"]
+        .max()
+        .reset_index()
+    )
     top = (
-        merged.sort_values("sim_mda", ascending=False)
-        .groupby(["ipo_id", "year"])
+        best_sim.sort_values("sim_mda", ascending=False)
+        .groupby(["ipo_id", "csrc3"])
         .head(top_n)
     )
 
-    # Build rival_fc by matching exchange prefix from ar_av_results conventions
-    # rival_fc format: "SH" + 6-digit code or "SZ" + 6-digit code
-    # We derive the prefix from stkcd_j: SH for 6xxxxx/9xxxxx, SZ otherwise
     def _to_fc(code: str) -> str:
         return ("SH" if code[0] in ("6", "9") else "SZ") + code
 
