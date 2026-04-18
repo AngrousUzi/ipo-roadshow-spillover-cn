@@ -14,6 +14,7 @@ Input:  carv/output/ar_av_results.csv  (contains event_date ± 1 trading day)
 Output: carv/output/car_timeseries.png
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -27,9 +28,12 @@ import matplotlib.cm as cm
 CARV_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = CARV_DIR / "output"
 ANN_DIR    = CARV_DIR.parent / "anns"
+IND_DIR    = CARV_DIR.parent / "ind"
 
 INPUT_FILE      = OUTPUT_DIR / "ar_av_results.csv"
 INDEX_PATH      = ANN_DIR / "IPO_index.xlsx"
+IPO_INDEX_CSV   = CARV_DIR / "IPO_roadshow_index_2009_with_trading_days.csv"
+TFIDF_PATH      = IND_DIR / "ind_all_sim_pairs_within_tfidf.csv"
 OUT_PLOT        = OUTPUT_DIR / "car_timeseries.png"
 OUT_CSV_PERIOD  = OUTPUT_DIR / "car_timeseries_period_avg.csv"
 OUT_CSV_YEAR    = OUTPUT_DIR / "car_timeseries_year_avg.csv"
@@ -61,7 +65,44 @@ def load_index() -> pd.DataFrame:
     return df[["ipo_id", "start_str", "start_type", "year", "period"]]
 
 
-def load_ar(index_df: pd.DataFrame) -> pd.DataFrame:
+def build_top_rivals_set(top_n: int) -> set:
+    """
+    Return a set of (ipo_id, rival_fc) pairs keeping only the top-N rivals
+    per IPO (per year) ranked by sim_mda descending.
+    """
+    idx_csv = pd.read_csv(
+        IPO_INDEX_CSV,
+        usecols=["Stkcd", "INDEX2009"],
+        encoding_errors="replace",
+    )
+    idx_csv.columns = ["stkcd_ipo", "ipo_id"]
+    idx_csv["stkcd_ipo"] = idx_csv["stkcd_ipo"].astype(str).str.zfill(6)
+
+    tfidf = pd.read_csv(TFIDF_PATH)
+    tfidf["stkcd_i"] = tfidf["stkcd_i"].astype(str).str.zfill(6)
+    tfidf["stkcd_j"] = tfidf["stkcd_j"].astype(str).str.zfill(6)
+
+    merged = tfidf.merge(idx_csv, left_on="stkcd_i", right_on="stkcd_ipo", how="inner")
+
+    top = (
+        merged.sort_values("sim_mda", ascending=False)
+        .groupby(["ipo_id", "year"])
+        .head(top_n)
+    )
+
+    # Build rival_fc by matching exchange prefix from ar_av_results conventions
+    # rival_fc format: "SH" + 6-digit code or "SZ" + 6-digit code
+    # We derive the prefix from stkcd_j: SH for 6xxxxx/9xxxxx, SZ otherwise
+    def _to_fc(code: str) -> str:
+        return ("SH" if code[0] in ("6", "9") else "SZ") + code
+
+    top = top.copy()
+    top["rival_fc"] = top["stkcd_j"].apply(_to_fc)
+    return set(zip(top["ipo_id"], top["rival_fc"]))
+
+
+def load_ar(index_df: pd.DataFrame,
+            top_rivals: set | None = None) -> pd.DataFrame:
     df = pd.read_csv(
         INPUT_FILE,
         usecols=["ipo_id", "rival_fc", "event_date", "timestamp"] + AR_COLS,
@@ -71,7 +112,13 @@ def load_ar(index_df: pd.DataFrame) -> pd.DataFrame:
     df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
     df.dropna(subset=["timestamp", "event_date"], inplace=True)
     # Filter to relevant ipo_ids immediately to shed ~60-70% of rows
-    return df.merge(index_df, on="ipo_id", how="inner")
+    df = df.merge(index_df, on="ipo_id", how="inner")
+    if top_rivals is not None:
+        mask = pd.Series(
+            list(zip(df["ipo_id"], df["rival_fc"])), index=df.index
+        ).isin(top_rivals)
+        df = df[mask]
+    return df
 
 
 # ── Bar index assignment (vectorised) ─────────────────────────────
@@ -251,6 +298,25 @@ def plot(period_avg: pd.DataFrame, year_avg: pd.DataFrame, out_path: Path):
 # ── Entry point ───────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="CAR time-series plot around IPO roadshow start")
+    parser.add_argument(
+        "--top", type=int, default=None, metavar="N",
+        help="Keep only top-N rivals per IPO ranked by mda_tfidf (sim_mda) descending. "
+             "Default: use all rivals.",
+    )
+    args = parser.parse_args()
+
+    top_rivals = None
+    if args.top is not None:
+        print(f"Building top-{args.top} rival set by sim_mda...")
+        top_rivals = build_top_rivals_set(args.top)
+        print(f"  {len(top_rivals):,} (ipo_id, rival_fc) pairs kept")
+
+    suffix = f"_top{args.top}" if args.top is not None else ""
+    out_plot       = OUTPUT_DIR / f"car_timeseries{suffix}.png"
+    out_csv_period = OUTPUT_DIR / f"car_timeseries_period_avg{suffix}.csv"
+    out_csv_year   = OUTPUT_DIR / f"car_timeseries_year_avg{suffix}.csv"
+
     print("Loading roadshow index...")
     index_df = load_index()
     n9  = (index_df["start_type"] == "9am").sum()
@@ -258,7 +324,7 @@ def main():
     print(f"  {len(index_df)} IPOs kept: {n9} × 09:00, {n14} × 14:00")
 
     print("Loading AR data (all ±1 day bars)...")
-    df = load_ar(index_df)
+    df = load_ar(index_df, top_rivals=top_rivals)
     print(f"  {len(df):,} raw bars loaded")
 
     print("Assigning trading bar indices...")
@@ -272,13 +338,13 @@ def main():
     period_avg, year_avg = build_averages(ev)
 
     print("Saving CSVs...")
-    period_avg.to_csv(OUT_CSV_PERIOD, index=False, encoding="utf-8-sig")
-    year_avg.to_csv(OUT_CSV_YEAR,   index=False, encoding="utf-8-sig")
-    print(f"  → {OUT_CSV_PERIOD}  ({len(period_avg):,} rows)")
-    print(f"  → {OUT_CSV_YEAR}  ({len(year_avg):,} rows)")
+    period_avg.to_csv(out_csv_period, index=False, encoding="utf-8-sig")
+    year_avg.to_csv(out_csv_year,     index=False, encoding="utf-8-sig")
+    print(f"  → {out_csv_period}  ({len(period_avg):,} rows)")
+    print(f"  → {out_csv_year}  ({len(year_avg):,} rows)")
 
     print("Plotting...")
-    plot(period_avg, year_avg, OUT_PLOT)
+    plot(period_avg, year_avg, out_plot)
     print("Done.")
 
 
