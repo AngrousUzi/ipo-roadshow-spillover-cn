@@ -296,8 +296,11 @@ for name, rel in sources.items():
 # ── 3b. Build verbal moderator aggregations (per session, from verbal source) ─
 verbal_mod_aggs = {}
 if active_verbal_mods:
-    for sess_label in [SESSION_推介, SESSION_答谢]:
-        v_agg, _ = session_variants[sess_label]["verbal"]
+    _verbal_path = ROOT / "analyze/output/verbal_sentiment.csv"
+    _verbal_sessions = [SESSION_推介, SESSION_答谢] if not PCA_MODE else [SESSION_推介]
+    _verbal_cache = {s: load_agg(_verbal_path, session_filter=s)[0] for s in _verbal_sessions}
+    for sess_label in _verbal_sessions:
+        v_agg = _verbal_cache[sess_label]
         cols_need  = [c for c in active_verbal_mods.values() if c in v_agg.columns]
         cols_miss  = [c for c in active_verbal_mods.values() if c not in v_agg.columns]
         if cols_miss:
