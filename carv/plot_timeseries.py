@@ -32,7 +32,7 @@ INPUT_FILE = OUTPUT_DIR / "ar_av_results.csv"
 INDEX_PATH = ANN_DIR / "IPO_index.xlsx"
 OUT_PLOT   = OUTPUT_DIR / "car_timeseries.png"
 
-AR_COL = "ar_est1"
+AR_COLS = ["ar_est1", "ar_est2", "ar_est3"]
 
 # Bar window around t=0 (1 bar = 5 trading minutes)
 # Prev-day close to today open ≈ 78 bars (prev day) + 0 for 9am / ~38 for 2pm
@@ -61,102 +61,106 @@ def load_index() -> pd.DataFrame:
 
 
 def load_ar(index_df: pd.DataFrame) -> pd.DataFrame:
-    df = pd.read_csv(INPUT_FILE, low_memory=False)
+    df = pd.read_csv(
+        INPUT_FILE,
+        usecols=["ipo_id", "rival_fc", "event_date", "timestamp"] + AR_COLS,
+        low_memory=False,
+    )
     df["timestamp"]  = pd.to_datetime(df["timestamp"],  errors="coerce")
     df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce")
     df.dropna(subset=["timestamp", "event_date"], inplace=True)
-    # All ±1 day buffer bars are retained — bar index assignment handles the windowing
+    # Filter to relevant ipo_ids immediately to shed ~60-70% of rows
     return df.merge(index_df, on="ipo_id", how="inner")
 
 
-# ── Bar index assignment ──────────────────────────────────────────
+# ── Bar index assignment (vectorised) ─────────────────────────────
 
 def assign_bar_index(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Assign a sequential trading bar index relative to the roadshow start.
+    Vectorised: no Python loop over groups.
 
-    For each (ipo_id, rival_fc, event_date):
-      1. Sort bars by timestamp.
-      2. Reference bar (index 0) = first bar on event_date whose timestamp
-         is >= the roadshow start timestamp.
-      3. Bars before reference get negative indices, bars after get positive.
+    1. Sort by (ipo_id, rival_fc, event_date, timestamp).
+    2. cumcount within each (ipo_id, rival_fc, event_date) group → bar_rank.
+    3. Flag ref candidates: bars on event_date with timestamp >= start_ts.
+    4. For each group take the first ref candidate's bar_rank → ref_rank.
+    5. bar_idx = bar_rank - ref_rank.
     """
-    out_parts = []
+    df = df.sort_values(["ipo_id", "rival_fc", "event_date", "timestamp"])
 
-    for (ipo_id, rival_fc, event_date), grp in df.groupby(
+    # start_ts vectorised
+    h = df["start_str"].str[:2].astype(int)
+    m = df["start_str"].str[3:5].astype(int)
+    df["start_ts"] = df["event_date"].dt.normalize() + pd.to_timedelta(h * 60 + m, unit="min")
+
+    df["bar_rank"] = df.groupby(
         ["ipo_id", "rival_fc", "event_date"], sort=False
-    ):
-        grp = grp.sort_values("timestamp").reset_index(drop=True)
+    ).cumcount()
 
-        # Build start_ts from start_str
-        start_str = grp["start_str"].iloc[0]
-        h, m = int(start_str[:2]), int(start_str[3:5])
-        d = event_date.date()
-        start_ts = pd.Timestamp(d.year, d.month, d.day, h, m)
+    is_ref = (
+        (df["timestamp"].dt.normalize() == df["event_date"].dt.normalize())
+        & (df["timestamp"] >= df["start_ts"])
+    )
 
-        # Reference bar: first bar on event_date with timestamp >= start_ts
-        on_event_day  = grp["timestamp"].dt.date == d
-        after_or_at   = grp["timestamp"] >= start_ts
-        ref_candidates = grp.index[on_event_day & after_or_at]
+    ref_rank = (
+        df[is_ref]
+        .groupby(["ipo_id", "rival_fc", "event_date"], sort=False)["bar_rank"]
+        .first()
+        .rename("ref_rank")
+        .reset_index()
+    )
 
-        if ref_candidates.empty:
-            continue
+    df = df.merge(ref_rank, on=["ipo_id", "rival_fc", "event_date"], how="inner")
+    df["bar_idx"] = df["bar_rank"] - df["ref_rank"]
+    df = df[(df["bar_idx"] >= -BARS_BEFORE) & (df["bar_idx"] <= BARS_AFTER)]
+    return df.drop(columns=["bar_rank", "ref_rank", "start_ts"])
 
-        ref_pos = ref_candidates[0]           # positional index within grp
-        grp["bar_idx"] = grp.index - ref_pos  # relative bar index
 
-        # Restrict to desired window
-        grp = grp[(grp["bar_idx"] >= -BARS_BEFORE) & (grp["bar_idx"] <= BARS_AFTER)]
-        out_parts.append(grp)
 
-    if not out_parts:
-        return pd.DataFrame()
-    return pd.concat(out_parts, ignore_index=True)
 
 
 # ── CAR calculation ───────────────────────────────────────────────
 
 def compute_car(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Per-event CAR normalised to 0 at bar_idx = 0.
+    Per-event CAR for each estimator, normalised to 0 at bar_idx = 0.
 
     1. Average AR across rival firms within each (ipo_id, event_date, bar_idx).
     2. Cumsum over bar_idx within each event.
     3. Subtract cumsum value at bar_idx == 0 so CAR(0) = 0.
+    Returns long-format with columns: ..., est, car
     """
-    ev = (
-        df.groupby(
-            ["ipo_id", "event_date", "bar_idx", "start_type", "year", "period"],
-            sort=False,
-        )[AR_COL]
-        .mean()
-        .reset_index(name="ar")
-    )
+    grp_cols = ["ipo_id", "event_date", "bar_idx", "start_type", "year", "period"]
+    ev = df.groupby(grp_cols, sort=False)[AR_COLS].mean().reset_index()
     ev.sort_values(["ipo_id", "event_date", "bar_idx"], inplace=True)
 
-    ev["car_raw"] = ev.groupby(["ipo_id", "event_date"])["ar"].cumsum()
+    # Cumsum and normalise for each estimator
+    parts = []
+    for col, est in zip(AR_COLS, [1, 2, 3]):
+        sub = ev[grp_cols + [col]].copy()
+        sub["car_raw"] = sub.groupby(["ipo_id", "event_date"])[col].cumsum()
+        ref = (
+            sub[sub["bar_idx"] == 0]
+            .groupby(["ipo_id", "event_date"])["car_raw"]
+            .first()
+            .rename("car_ref")
+            .reset_index()
+        )
+        sub = sub.merge(ref, on=["ipo_id", "event_date"], how="left")
+        sub["car"] = sub["car_raw"] - sub["car_ref"]
+        sub["est"] = est
+        parts.append(sub[grp_cols + ["est", "car"]])
 
-    # Normalise: subtract value at bar_idx == 0
-    ref = (
-        ev[ev["bar_idx"] == 0]
-        .groupby(["ipo_id", "event_date"])["car_raw"]
-        .first()
-        .rename("car_ref")
-        .reset_index()
-    )
-    ev = ev.merge(ref, on=["ipo_id", "event_date"], how="left")
-    ev["car"] = ev["car_raw"] - ev["car_ref"]
-    return ev
+    return pd.concat(parts, ignore_index=True)
 
 
 # ── Aggregation ───────────────────────────────────────────────────
 
 def build_averages(ev: pd.DataFrame):
     period_avg = (
-        ev.groupby(["start_type", "period", "bar_idx"])["car"].mean().reset_index()
+        ev.groupby(["start_type", "period", "est", "bar_idx"])["car"].mean().reset_index()
     )
     year_avg = (
-        ev.groupby(["start_type", "year", "bar_idx"])["car"].mean().reset_index()
+        ev.groupby(["start_type", "year", "est", "bar_idx"])["car"].mean().reset_index()
     )
     return period_avg, year_avg
 
@@ -188,48 +192,54 @@ SESSION_LINES = {
 }
 
 
-def plot(period_avg: pd.DataFrame, year_avg: pd.DataFrame, out_path: Path):
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    configs = [("9am", "09:00 AM Start"), ("2pm", "14:00 PM Start")]
+EST_LINESTYLES = {1: "-", 2: "--", 3: ":"}
 
-    for ax, (st, title) in zip(axes, configs):
-        st_year = year_avg[year_avg["start_type"] == st]
-        years   = sorted(st_year["year"].unique())
-        cmap    = cm.get_cmap("tab20", max(len(years), 1))
+def _draw_panel(ax, st: str, est: int,
+                period_avg: pd.DataFrame, year_avg: pd.DataFrame):
+    st_year = year_avg[(year_avg["start_type"] == st) & (year_avg["est"] == est)]
+    years   = sorted(st_year["year"].unique())
+    cmap    = cm.get_cmap("tab20", max(len(years), 1))
 
-        # Thin yearly lines
-        for i, yr in enumerate(years):
-            sub = st_year[st_year["year"] == yr]
+    for i, yr in enumerate(years):
+        sub = st_year[st_year["year"] == yr]
+        ax.plot(sub["bar_idx"], sub["car"],
+                color=cmap(i), alpha=0.35, lw=0.9, label=str(yr))
+
+    st_period = period_avg[(period_avg["start_type"] == st) & (period_avg["est"] == est)]
+    for period, color in PERIOD_COLORS.items():
+        sub = st_period[st_period["period"] == period]
+        if not sub.empty:
             ax.plot(sub["bar_idx"], sub["car"],
-                    color=cmap(i), alpha=0.35, lw=0.9, label=str(yr))
+                    color=color, lw=2.5, zorder=5, label=period)
 
-        # Bold period averages
-        st_period = period_avg[period_avg["start_type"] == st]
-        for period, color in PERIOD_COLORS.items():
-            sub = st_period[st_period["period"] == period]
-            if not sub.empty:
-                ax.plot(sub["bar_idx"], sub["car"],
-                        color=color, lw=2.5, zorder=5, label=period)
+    for bar_pos, lbl in SESSION_LINES.get(st, []):
+        ls  = "--" if lbl == "start" else ":"
+        lw  = 1.2  if lbl == "start" else 0.8
+        clr = "black" if lbl == "start" else "gray"
+        ax.axvline(bar_pos, color=clr, lw=lw, linestyle=ls, alpha=0.8)
 
-        # Session boundary lines
-        for bar_pos, lbl in SESSION_LINES.get(st, []):
-            ls = "--" if lbl == "start" else ":"
-            lw = 1.2 if lbl == "start" else 0.8
-            clr = "black" if lbl == "start" else "gray"
-            ax.axvline(bar_pos, color=clr, lw=lw, linestyle=ls, alpha=0.8,
-                       label=lbl if lbl == "start" else None)
-            if lbl != "start":
-                ax.text(bar_pos + 0.5, ax.get_ylim()[0], lbl,
-                        fontsize=6, color="gray", va="bottom")
+    ax.axhline(0, color="gray", lw=0.5, linestyle=":")
+    ax.set_xlim(-BARS_BEFORE, BARS_AFTER)
 
-        ax.axhline(0, color="gray", lw=0.5, linestyle=":")
-        ax.set_xlabel("Trading bars from roadshow start  (1 bar = 5 min)")
-        ax.set_ylabel("Average CAR  (normalised to 0 at bar 0)")
-        ax.set_title(title)
-        ax.set_xlim(-BARS_BEFORE, BARS_AFTER)
-        ax.legend(fontsize=7, ncol=2, loc="upper left")
 
-    plt.suptitle("Rival-Firm CAR Around IPO Roadshow Start", fontsize=12, y=1.01)
+def plot(period_avg: pd.DataFrame, year_avg: pd.DataFrame, out_path: Path):
+    # Layout: 3 rows (est1/2/3) × 2 cols (9am / 2pm)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
+    start_configs = [("9am", "09:00 Start"), ("2pm", "14:00 Start")]
+
+    for col_i, (st, st_title) in enumerate(start_configs):
+        for row_i, est in enumerate([1, 2, 3]):
+            ax = axes[row_i, col_i]
+            _draw_panel(ax, st, est, period_avg, year_avg)
+            ax.set_ylabel(f"CAR  (est{est})", fontsize=8)
+            if row_i == 0:
+                ax.set_title(st_title, fontsize=10)
+            if row_i == 2:
+                ax.set_xlabel("Trading bars from roadshow start  (1 bar = 5 min)")
+            if row_i == 0 and col_i == 1:
+                ax.legend(fontsize=7, ncol=2, loc="upper left")
+
+    plt.suptitle("Rival-Firm CAR Around IPO Roadshow Start", fontsize=12)
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved → {out_path}")
