@@ -254,9 +254,9 @@ sources = {
     "visual":     "analyze/output/visual_gaze.csv",
     "visual_fer": "analyze/output/visual_fer.csv",
 }
-# When --pca, replace sources with pre-computed 推介 PCA scores (one file, all groups)
+# When --pca, replace sources with pre-computed combined-dimension 推介 PCA scores
 if PCA_MODE:
-    sources = {"pca": "final/pca/pca_scores_推介.csv"}
+    sources = {"pca": "final/pca/pca_scores_combined_tui.csv"}
 
 def load_agg(path, session_filter=None):
     df = pd.read_csv(path)
@@ -619,6 +619,115 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
 
+def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
+    """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs).
+    SE clustered at ipo_id level (peer-level data)."""
+    records = []
+    merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
+
+    for grp in ("am", "pm"):
+        sub = merged[merged["group"] == grp].reset_index(drop=True)
+
+        fe_parts = []
+        for fc in fe_cols:
+            if fc in sub.columns:
+                dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
+                fe_parts.append(dum.values)
+        fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
+
+        ctrl_arr = None
+        if ctrl_cols:
+            ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32).copy()
+            for j in range(ctrl_arr.shape[1]):
+                ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+        for y_col in y_cols:
+            y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+            X_all = np.column_stack([
+                maybe_winsorize(sub[pc].to_numpy(dtype=float, na_value=np.nan))
+                for pc in pc_cols
+            ])
+
+            for n in range(1, len(pc_cols) + 1):
+                x_subset = pc_cols[:n]
+                X_n = X_all[:, :n]
+
+                base_ok = finite_mask(y_arr)
+                for j in range(n):
+                    base_ok &= finite_mask(X_n[:, j])
+                if base_ok.sum() < 15:
+                    continue
+
+                y_b = y_arr[base_ok]
+                X_b = X_n[base_ok] if n > 1 else X_n[base_ok].reshape(-1, 1)
+                g_b = sub.loc[base_ok, "ipo_id"].values
+
+                rec = {
+                    "group":           grp,
+                    "y_col":           y_col,
+                    "n_pcs":           n,
+                    "x_cols_included": ",".join(x_subset),
+                }
+
+                core = X_b
+                if fe_arr is not None:
+                    X_bi, _ = safe_add_constant(np.column_stack([core, fe_arr[base_ok]]))
+                else:
+                    X_bi, _ = safe_add_constant(core)
+                try:
+                    res_bi = run_ols_clustered(y_b, X_bi, g_b)
+                    rec["n_obs"]  = int(base_ok.sum())
+                    rec["n_ipo"]  = int(pd.Series(g_b).nunique())
+                    rec["r2"]     = res_bi.rsquared
+                    for i, pc in enumerate(x_subset):
+                        rec[f"coef_{pc}"]   = res_bi.params[1 + i]
+                        rec[f"se_{pc}"]     = res_bi.bse[1 + i]
+                        rec[f"tstat_{pc}"]  = res_bi.tvalues[1 + i]
+                        rec[f"pvalue_{pc}"] = res_bi.pvalues[1 + i]
+                except Exception as e:
+                    rec["error_bi"] = str(e)
+
+                if ctrl_arr is not None:
+                    ctrl_ok = base_ok.copy()
+                    for j in range(ctrl_arr.shape[1]):
+                        ctrl_ok &= finite_mask(ctrl_arr[:, j])
+                    rec["n_obs_ctrl"] = int(ctrl_ok.sum())
+                    g_c = sub.loc[ctrl_ok, "ipo_id"].values
+                    rec["n_ipo_ctrl"] = int(pd.Series(g_c).nunique())
+                    if ctrl_ok.sum() >= 15:
+                        y_c   = y_arr[ctrl_ok]
+                        X_c   = X_n[ctrl_ok] if n > 1 else X_n[ctrl_ok].reshape(-1, 1)
+                        ctrlv = ctrl_arr[ctrl_ok]
+                        if fe_arr is not None:
+                            _inner = np.column_stack([X_c, ctrlv, fe_arr[ctrl_ok]])
+                        else:
+                            _inner = np.column_stack([X_c, ctrlv])
+                        X_ctrl, _keep = safe_add_constant(_inner)
+                        _ctrl_keep = _keep[n: n + len(ctrl_cols)]
+                        try:
+                            res_ct = run_ols_clustered(y_c, X_ctrl, g_c)
+                            rec["r2_ctrl"] = res_ct.rsquared
+                            for i, pc in enumerate(x_subset):
+                                rec[f"coef_{pc}_ctrl"]   = res_ct.params[1 + i]
+                                rec[f"se_{pc}_ctrl"]     = res_ct.bse[1 + i]
+                                rec[f"tstat_{pc}_ctrl"]  = res_ct.tvalues[1 + i]
+                                rec[f"pvalue_{pc}_ctrl"] = res_ct.pvalues[1 + i]
+                            _kept_i = 0
+                            for j, cc in enumerate(ctrl_cols):
+                                if _ctrl_keep[j]:
+                                    rec[f"coef_{cc}_ctrl"] = res_ct.params[1 + n + _kept_i]
+                                    rec[f"pval_{cc}_ctrl"] = res_ct.pvalues[1 + n + _kept_i]
+                                    _kept_i += 1
+                        except Exception as e:
+                            rec["error_ctrl"] = str(e)
+                    else:
+                        rec["error_ctrl"] = "too few obs after ctrl dropna"
+
+                records.append(rec)
+        print(f"  group='{grp}' done")
+    return pd.DataFrame(records)
+
+
 def summarise(out, label, ctrl_cols, fe_cols):
     fe_tag = ""
     if "event_year" in fe_cols: fe_tag += "+YFE"
@@ -647,16 +756,25 @@ def summarise(out, label, ctrl_cols, fe_cols):
                       f"p<0.05={(ok<0.05).sum()}, "
                       f"p<0.10={(ok<0.10).sum()} (of {len(ok)})")
 
-for y_group, y_cols in y_col_groups.items():
-    print(f"\n=== Running {y_group} ({len(y_cols)} Y cols) ===")
-    out = run_regressions(
-        car_grp, y_cols, session_variants, ctrl_present, fe_cols,
-        mkt_mod=MKT_MOD, mkt_col=MKT_COL,
-        verbal_mods=active_verbal_mods if active_verbal_mods else None,
-        qa_mods=active_qa_mods     if active_qa_mods     else None,
-        verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
-    )
-    out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
-    out.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"Saved {len(out)} rows → {out_path}")
-    summarise(out, y_group, ctrl_present, fe_cols)
+if PCA_MODE:
+    _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+    for y_group, y_cols in y_col_groups.items():
+        print(f"\n=== Running PCA cumulative {y_group} ({len(y_cols)} Y cols, {len(_pc_cols)} PCs) ===")
+        out = run_regressions_pca(car_grp, y_cols, _x_df, _pc_cols, ctrl_present, fe_cols)
+        out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
+        out.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"Saved {len(out)} rows → {out_path}")
+else:
+    for y_group, y_cols in y_col_groups.items():
+        print(f"\n=== Running {y_group} ({len(y_cols)} Y cols) ===")
+        out = run_regressions(
+            car_grp, y_cols, session_variants, ctrl_present, fe_cols,
+            mkt_mod=MKT_MOD, mkt_col=MKT_COL,
+            verbal_mods=active_verbal_mods if active_verbal_mods else None,
+            qa_mods=active_qa_mods     if active_qa_mods     else None,
+            verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
+        )
+        out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
+        out.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"Saved {len(out)} rows → {out_path}")
+        summarise(out, y_group, ctrl_present, fe_cols)
