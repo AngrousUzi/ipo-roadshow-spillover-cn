@@ -68,6 +68,8 @@ def _parse_args():
                    help="Add market moderation: ret_4w_sh000300 main effect + X*mkt interaction")
     p.add_argument("--winsor", action=argparse.BooleanOptionalAction, default=True,
                    help="Winsorize all continuous variables at [1%%, 99%%] (default: on)")
+    p.add_argument("--winsor-x", action=argparse.BooleanOptionalAction, default=True,
+                   help="Winsorize X (main predictor) at [1%%, 99%%]; set --no-winsor-x to skip (e.g. for PCA scores)")
     p.add_argument("--top-rivals", type=int, default=None,
                    help="Keep only top-N rivals per IPO by sim_mda similarity; "
                         "drop IPO samples that have fewer than N rivals (e.g. 1, 3, 5)")
@@ -103,6 +105,7 @@ IND_COL             = "csrc3"       # column for IND_FE (CSRC 3-digit industry c
 MKT_MOD             = _args.mkt_mod # market moderation via ret_4w_sh000300
 MKT_COL             = "ret_4w_sh000300"  # market proxy for moderation
 WINSORIZE           = _args.winsor       # winsorize all continuous vars at [1 %, 99 %]
+WINSORIZE_X         = _args.winsor_x and _args.winsor  # winsorize X (main predictor); requires --winsor
 WINSOR_BOUNDS       = (0.01, 0.99)
 TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim_mda (None = all)
 PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
@@ -325,6 +328,9 @@ def winsorize(arr):
 def maybe_winsorize(arr):
     return winsorize(arr) if WINSORIZE else np.asarray(arr, dtype=float)
 
+def maybe_winsorize_x(arr):
+    return winsorize(arr) if WINSORIZE_X else np.asarray(arr, dtype=float)
+
 def _drop_const_cols(mat):
     """Return (cleaned_mat, kept_bool_mask) — removes zero-variance columns."""
     keep = np.std(mat, axis=0) > 0
@@ -407,7 +413,7 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                 for y_col in y_cols:
                     y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
                     for x_col in x_cols:
-                        x_arr = maybe_winsorize(sub[x_col].to_numpy(dtype=float, na_value=np.nan))
+                        x_arr = maybe_winsorize_x(sub[x_col].to_numpy(dtype=float, na_value=np.nan))
 
                         base_ok = finite_mask(y_arr) & finite_mask(x_arr)
                         if mkt_mod and mkt_arr_full is not None:
@@ -644,7 +650,7 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
         for y_col in y_cols:
             y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
             X_all = np.column_stack([
-                maybe_winsorize(sub[pc].to_numpy(dtype=float, na_value=np.nan))
+                maybe_winsorize_x(sub[pc].to_numpy(dtype=float, na_value=np.nan))
                 for pc in pc_cols
             ])
 
