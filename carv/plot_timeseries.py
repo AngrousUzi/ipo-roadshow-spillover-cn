@@ -127,7 +127,8 @@ def compute_car(df: pd.DataFrame) -> pd.DataFrame:
 
     1. Average AR across rival firms within each (ipo_id, event_date, bar_idx).
     2. Cumsum over bar_idx within each event.
-    3. Subtract cumsum value at bar_idx == 0 so CAR(0) = 0.
+    3. Subtract cumsum value at bar_idx == -1 so CAR(-1) = 0 (bar 0 already reflects
+       the roadshow effect).
     Returns long-format with columns: ..., est, car
     """
     grp_cols = ["ipo_id", "event_date", "bar_idx", "start_type", "year", "period"]
@@ -140,7 +141,7 @@ def compute_car(df: pd.DataFrame) -> pd.DataFrame:
         sub = ev[grp_cols + [col]].copy()
         sub["car_raw"] = sub.groupby(["ipo_id", "event_date"])[col].cumsum()
         ref = (
-            sub[sub["bar_idx"] == 0]
+            sub[sub["bar_idx"] == -1]
             .groupby(["ipo_id", "event_date"])["car_raw"]
             .first()
             .rename("car_ref")
@@ -233,7 +234,7 @@ def plot(period_avg: pd.DataFrame, year_avg: pd.DataFrame, out_path: Path):
         for row_i, est in enumerate([1, 2, 3]):
             ax = axes[row_i, col_i]
             _draw_panel(ax, st, est, period_avg, year_avg)
-            ax.set_ylabel(f"CAR  (est{est})", fontsize=8)
+            ax.set_ylabel(f"CAR  (est{est}, base = bar −1)", fontsize=8)
             if row_i == 0:
                 ax.set_title(st_title, fontsize=10)
             if row_i == 2:
