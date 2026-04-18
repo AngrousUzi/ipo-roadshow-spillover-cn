@@ -16,7 +16,7 @@ Output: carv/output/car_timeseries.png
 
 import argparse
 from pathlib import Path
-
+import os
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -29,15 +29,20 @@ CARV_DIR   = Path(__file__).resolve().parent
 OUTPUT_DIR = CARV_DIR / "output"
 ANN_DIR    = CARV_DIR.parent / "anns"
 IND_DIR    = CARV_DIR.parent / "ind"
-
-INPUT_FILE      = OUTPUT_DIR / "ar_av_results.csv"
-INDEX_PATH      = ANN_DIR / "IPO_index.xlsx"
-IPO_INDEX_CSV   = CARV_DIR / "IPO_roadshow_index_2009_with_trading_days.csv"
-TFIDF_PATH      = IND_DIR / "ind_all_sim_pairs_within_tfidf.csv"
-OUT_PLOT        = OUTPUT_DIR / "car_timeseries.png"
-OUT_CSV_PERIOD  = OUTPUT_DIR / "car_timeseries_period_avg.csv"
-OUT_CSV_YEAR    = OUTPUT_DIR / "car_timeseries_year_avg.csv"
-
+if os.name=="nt":  # Windows
+    INPUT_FILE  = OUTPUT_DIR / "ar_av_results.csv"
+    INDEX_PATH  = ANN_DIR / "IPO_index.xlsx"
+    TFIDF_PATH  = IND_DIR / "ind_all_sim_pairs_within_tfidf.csv"
+    OUT_PLOT        = OUTPUT_DIR / "car_timeseries.png"
+    OUT_CSV_PERIOD  = OUTPUT_DIR / "car_timeseries_period_avg.csv"
+    OUT_CSV_YEAR    = OUTPUT_DIR / "car_timeseries_year_avg.csv"
+else:
+    INPUT_FILE  = OUTPUT_DIR / "ar_av_results.csv"
+    INDEX_PATH  = Path("..") / "IPO_index.xlsx"
+    TFIDF_PATH  = Path("..") / "ind_all_sim_pairs_within_tfidf.csv"
+    OUT_PLOT        = OUTPUT_DIR / "car_timeseries.png"
+    OUT_CSV_PERIOD  = OUTPUT_DIR / "car_timeseries_period_avg.csv"
+    OUT_CSV_YEAR    = OUTPUT_DIR / "car_timeseries_year_avg.csv"
 AR_COLS = ["ar_est1", "ar_est2", "ar_est3"]
 
 # ±40 bars = ±200 trading minutes around roadshow start
@@ -70,19 +75,16 @@ def build_top_rivals_set(top_n: int) -> set:
     Return a set of (ipo_id, rival_fc) pairs keeping only the top-N rivals
     per IPO (per year) ranked by sim_mda descending.
     """
-    idx_csv = pd.read_csv(
-        IPO_INDEX_CSV,
-        usecols=["Stkcd", "INDEX2009"],
-        encoding_errors="replace",
-    )
-    idx_csv.columns = ["stkcd_ipo", "ipo_id"]
-    idx_csv["stkcd_ipo"] = idx_csv["stkcd_ipo"].astype(str).str.zfill(6)
+    idx_xl = pd.read_excel(INDEX_PATH, usecols=["Stkcd", "INDEX2009"], dtype=str)
+    idx_xl.columns = ["stkcd_ipo", "ipo_id"]
+    idx_xl["stkcd_ipo"] = idx_xl["stkcd_ipo"].str.zfill(6)
+    idx_xl = idx_xl.dropna(subset=["stkcd_ipo", "ipo_id"]).drop_duplicates("ipo_id")
 
     tfidf = pd.read_csv(TFIDF_PATH)
     tfidf["stkcd_i"] = tfidf["stkcd_i"].astype(str).str.zfill(6)
     tfidf["stkcd_j"] = tfidf["stkcd_j"].astype(str).str.zfill(6)
 
-    merged = tfidf.merge(idx_csv, left_on="stkcd_i", right_on="stkcd_ipo", how="inner")
+    merged = tfidf.merge(idx_xl, left_on="stkcd_i", right_on="stkcd_ipo", how="inner")
 
     top = (
         merged.sort_values("sim_mda", ascending=False)
