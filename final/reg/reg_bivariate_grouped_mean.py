@@ -62,6 +62,10 @@ def _parse_args():
                    help="Moderation by a_prospect_ratio from qa_analysis.csv (IPO-level)")
     p.add_argument("--pca",             action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
+    p.add_argument("--group",      type=str, default=None,
+                   help="PCA mode only: PC column to split into quantile groups (e.g. pc1, pc2, pc3)")
+    p.add_argument("--group-size", type=int, default=5,
+                   help="Number of quantile groups when --group is active (default: 5)")
     return p.parse_args()
 
 _args = _parse_args()
@@ -77,6 +81,8 @@ WINSOR_BOUNDS = (0.01, 0.99)   # winsorize all variables at [1 %, 99 %]
 MKT_MOD       = _args.mkt_mod
 MKT_COL       = "ret_4w_sh000300"
 PCA_MODE      = _args.pca          # use 推介 PCA scores as X features
+GROUP_COL     = _args.group if _args.pca else None  # PC column to quantile-split (PCA mode only)
+GROUP_SIZE    = _args.group_size   # number of quantile groups
 
 SESSION_推介 = "推介"
 SESSION_答谢 = "答谢"
@@ -527,7 +533,8 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, use_fe,
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
 
-def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe):
+def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe,
+                         group_col="group", group_values=("am", "pm")):
     """
     PCA cumulative regression: for n=1..len(pc_cols), regress Y on [pc1..pcN].
     One record per (group, y_col, n_pcs).
@@ -535,8 +542,8 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe):
     records = []
     merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
 
-    for grp in ("am", "pm"):
-        sub = merged[merged["group"] == grp].reset_index(drop=True)
+    for grp in group_values:
+        sub = merged[merged[group_col] == grp].reset_index(drop=True)
 
         yr_arr = None
         if use_fe and "event_year" in sub.columns:
@@ -672,10 +679,34 @@ _pca_suffix = "_pca" if PCA_MODE else ""
 if PCA_MODE:
     # Extract the merged x_df and pc column list from session_variants (推介 only)
     _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+
+    # Compute quantile groups on the specified PC column when --group is active
+    _group_col    = "group"
+    _group_values = ("am", "pm")
+    _car_grp_pca  = car_grp
+    _grp_suffix   = ""
+    if GROUP_COL is not None:
+        _ipo_grp = _x_df[["ipo_id", GROUP_COL]].copy()
+        _ipo_grp["pc_group"] = pd.qcut(
+            _ipo_grp[GROUP_COL], GROUP_SIZE,
+            labels=[f"q{i+1}" for i in range(GROUP_SIZE)],
+            duplicates="drop",
+        )
+        _car_grp_pca = car_grp.merge(
+            _ipo_grp[["ipo_id", "pc_group"]], on="ipo_id", how="left"
+        )
+        _group_col    = "pc_group"
+        _group_values = [f"q{i+1}" for i in range(GROUP_SIZE)]
+        _grp_suffix   = f"_grp_{GROUP_COL}_{GROUP_SIZE}"
+        print(f"Group mode: {GROUP_COL} → {GROUP_SIZE} quantile groups "
+              f"({_ipo_grp['pc_group'].value_counts().sort_index().to_dict()})")
+
     for y_group, y_cols in y_col_groups.items():
-        print(f"\n=== Running PCA cumulative {y_group} ({len(y_cols)} Y cols, {len(_pc_cols)} PCs) ===")
-        out = run_regressions_pca(car_grp, y_cols, _x_df, _pc_cols, ctrl_present, USE_FE)
-        out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_{y_group}_ctrl_fe{_pca_suffix}.csv"
+        print(f"\n=== Running PCA cumulative {y_group} ({len(y_cols)} Y cols, {len(_pc_cols)} PCs, "
+              f"groups={list(_group_values)}) ===")
+        out = run_regressions_pca(_car_grp_pca, y_cols, _x_df, _pc_cols, ctrl_present, USE_FE,
+                                   group_col=_group_col, group_values=_group_values)
+        out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_{y_group}_ctrl_fe{_pca_suffix}{_grp_suffix}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"Saved {len(out)} rows → {out_path}")
 else:

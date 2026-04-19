@@ -91,6 +91,10 @@ def _parse_args():
                    help="Moderation by qa_pairs (Q&A count) from qa_analysis.csv (IPO-level)")
     p.add_argument("--pca",             action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
+    p.add_argument("--group",      type=str, default=None,
+                   help="PCA mode only: PC column to split into quantile groups (e.g. pc1, pc2, pc3)")
+    p.add_argument("--group-size", type=int, default=5,
+                   help="Number of quantile groups when --group is active (default: 5)")
     return p.parse_args()
 
 _args = _parse_args()
@@ -112,6 +116,8 @@ WINSORIZE_X         = _args.winsor_x and _args.winsor  # winsorize X (main predi
 WINSOR_BOUNDS       = (0.01, 0.99)
 TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim_mda (None = all)
 PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
+GROUP_COL           = _args.group if _args.pca else None  # PC column to quantile-split (PCA mode only)
+GROUP_SIZE          = _args.group_size   # number of quantile groups
 
 RIVAL_CONTROL_1 = ["log_size", "bm", "roa", "leverage"]
 RIVAL_CONTROL_2 = ["age_listed", "age_estab"]
@@ -156,6 +162,7 @@ if MKT_MOD:             _suffix_parts.append("mkt")
 if WINSORIZE:           _suffix_parts.append("w99")
 if TOP_RIVALS is not None: _suffix_parts.append(f"top{TOP_RIVALS}")
 if PCA_MODE:            _suffix_parts.append("pca")
+if GROUP_COL is not None: _suffix_parts.append(f"grp_{GROUP_COL}_{GROUP_SIZE}")
 for k in active_verbal_mods: _suffix_parts.append(k)
 for k in active_qa_mods:     _suffix_parts.append(k)
 OUTPUT_SUFFIX = ("_" + "_".join(_suffix_parts)) if _suffix_parts else "_base"
@@ -633,7 +640,8 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
     return pd.DataFrame(records)
 
 def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
-                         mkt_mod=False, mkt_col=None, all_mods_cfg=None):
+                         mkt_mod=False, mkt_col=None, all_mods_cfg=None,
+                         group_col="group", group_values=("am", "pm")):
     """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs).
     SE clustered at ipo_id level (peer-level data).
 
@@ -653,8 +661,8 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
     records = []
     merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
 
-    for grp in ("am", "pm"):
-        sub = merged[merged["group"] == grp].reset_index(drop=True)
+    for grp in group_values:
+        sub = merged[merged[group_col] == grp].reset_index(drop=True)
 
         fe_parts = []
         for fc in fe_cols:
@@ -907,15 +915,36 @@ if PCA_MODE:
         else:
             print(f"  WARNING: verbal mod col '{col}' not in car_grp — skipping {mod_name}")
 
+    # Compute quantile groups on the specified PC column when --group is active
+    _group_col    = "group"
+    _group_values = ("am", "pm")
+    _car_grp_pca  = car_grp
+    if GROUP_COL is not None:
+        # Use _x_df (already 1 row per ipo_id) to avoid a many-to-many merge explosion
+        _ipo_grp = _x_df[["ipo_id", GROUP_COL]].copy()
+        _ipo_grp["pc_group"] = pd.qcut(
+            _ipo_grp[GROUP_COL], GROUP_SIZE,
+            labels=[f"q{i+1}" for i in range(GROUP_SIZE)],
+            duplicates="drop",
+        )
+        _car_grp_pca = car_grp.merge(
+            _ipo_grp[["ipo_id", "pc_group"]], on="ipo_id", how="left"
+        )
+        _group_col    = "pc_group"
+        _group_values = [f"q{i+1}" for i in range(GROUP_SIZE)]
+        print(f"Group mode: {GROUP_COL} → {GROUP_SIZE} quantile groups "
+              f"({_ipo_grp['pc_group'].value_counts().sort_index().to_dict()})")
+
     for y_group, y_cols in y_col_groups.items():
         _active_mods = [m[0] for m in _pca_mods_cfg] + (["mkt"] if MKT_MOD else [])
         print(f"\n=== Running PCA cumulative {y_group} "
               f"({len(y_cols)} Y cols, {len(_pc_cols)} PCs, "
-              f"mods={_active_mods}) ===")
+              f"groups={list(_group_values)}, mods={_active_mods}) ===")
         out = run_regressions_pca(
-            car_grp, y_cols, _x_df, _pc_cols, ctrl_present, fe_cols,
+            _car_grp_pca, y_cols, _x_df, _pc_cols, ctrl_present, fe_cols,
             mkt_mod=MKT_MOD, mkt_col=MKT_COL,
             all_mods_cfg=_pca_mods_cfg,
+            group_col=_group_col, group_values=_group_values,
         )
         out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
