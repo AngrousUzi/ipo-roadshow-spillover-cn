@@ -220,8 +220,9 @@ print(f"Loaded controls CSV: {len(car)} peer-rows, "
       f"controls={ctrl_present}, fe_cols={fe_cols}, mkt_mod={MKT_MOD}")
 
 y_col_groups = {
-    "after_start": [c for c in car.columns if c.startswith("car_after_start_")],
-    "after_end":   [c for c in car.columns if c.startswith("car_after_end_")],
+    "before_start": [c for c in car.columns if c.startswith("car_before_start_")],
+    "after_start":  [c for c in car.columns if c.startswith("car_after_start_")],
+    "after_end":    [c for c in car.columns if c.startswith("car_after_end_")],
 }
 print(f"Y groups: { {k: len(v) for k, v in y_col_groups.items()} }")
 
