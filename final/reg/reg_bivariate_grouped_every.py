@@ -632,9 +632,24 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
 
-def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
+def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
+                         mkt_mod=False, mkt_col=None, all_mods_cfg=None):
     """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs).
-    SE clustered at ipo_id level (peer-level data)."""
+    SE clustered at ipo_id level (peer-level data).
+
+    Moderation model (per active mod, unified for mkt and verbal/qa mods):
+      Y ~ const + pc1..pcN + MOD + pc1*MOD..pcN*MOD [+ controls] [+ FE]
+    Param layout: [0]=const [1..N]=PCs [N+1]=MOD [N+2..2N+1]=PC*MOD [2N+2..]=controls
+
+    Stores per moderator {mod_name}:
+      n_obs_mod_{mod_name}[_ctrl], n_ipo_mod_{mod_name}[_ctrl], r2_mod_{mod_name}[_ctrl]
+      coef_mod_{mod_name}[_ctrl], pval_mod_{mod_name}[_ctrl]          (MOD main effect)
+      coef_{pc}_mod_{mod_name}[_ctrl], tstat_{pc}_mod_{mod_name}[_ctrl], pvalue_{pc}_mod_{mod_name}[_ctrl]
+      coef_interact_{mod_name}_{pc}[_ctrl], tstat_interact_{mod_name}_{pc}[_ctrl], pvalue_interact_{mod_name}_{pc}[_ctrl]
+    """
+    if all_mods_cfg is None:
+        all_mods_cfg = []
+
     records = []
     merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
 
@@ -653,6 +668,15 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
             ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32).copy()
             for j in range(ctrl_arr.shape[1]):
                 ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+        # Pre-build moderator arrays for this group
+        # mkt treated uniformly as mod_name="mkt" alongside verbal/qa mods
+        _mod_arrays = {}  # mod_name -> full-length array
+        if mkt_mod and mkt_col and mkt_col in sub.columns:
+            _mod_arrays["mkt"] = maybe_winsorize(sub[mkt_col].to_numpy(dtype=float, na_value=np.nan))
+        for mod_name, col in all_mods_cfg:
+            if col in sub.columns:
+                _mod_arrays[mod_name] = maybe_winsorize(sub[col].to_numpy(dtype=float, na_value=np.nan))
 
         for y_col in y_cols:
             y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
@@ -682,11 +706,11 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
                     "x_cols_included": ",".join(x_subset),
                 }
 
-                core = X_b
+                # ── Bivariate (no controls) ───────────────────────────────────
                 if fe_arr is not None:
-                    X_bi, _ = safe_add_constant(np.column_stack([core, fe_arr[base_ok]]))
+                    X_bi, _ = safe_add_constant(np.column_stack([X_b, fe_arr[base_ok]]))
                 else:
-                    X_bi, _ = safe_add_constant(core)
+                    X_bi, _ = safe_add_constant(X_b)
                 try:
                     res_bi = run_ols_clustered(y_b, X_bi, g_b)
                     rec["n_obs"]  = int(base_ok.sum())
@@ -700,6 +724,7 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
                 except Exception as e:
                     rec["error_bi"] = str(e)
 
+                # ── With controls ─────────────────────────────────────────────
                 if ctrl_arr is not None:
                     ctrl_ok = base_ok.copy()
                     for j in range(ctrl_arr.shape[1]):
@@ -736,6 +761,94 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols):
                     else:
                         rec["error_ctrl"] = "too few obs after ctrl dropna"
 
+                # ── Moderation specs (bivariate + controlled) ─────────────────
+                # Model: Y ~ const + pc1..pcN + MOD + pc1*MOD..pcN*MOD [+ ctrl] [+ FE]
+                # Param layout: [0]=const [1..N]=PCs [N+1]=MOD [N+2..2N+1]=interactions [2N+2..]=ctrl
+                for mod_name, mod_arr_full in _mod_arrays.items():
+                    mod_ok = base_ok & finite_mask(mod_arr_full)
+                    rec[f"n_obs_mod_{mod_name}"] = int(mod_ok.sum())
+                    if mod_ok.sum() < 15:
+                        continue
+
+                    y_m   = y_arr[mod_ok]
+                    X_m   = X_n[mod_ok] if n > 1 else X_n[mod_ok].reshape(-1, 1)
+                    mval  = mod_arr_full[mod_ok]
+                    g_m   = sub.loc[mod_ok, "ipo_id"].values
+                    # Build interaction block: N columns (one per PC)
+                    int_m = X_m * mval[:, None]
+                    core_m = np.column_stack([X_m, mval[:, None], int_m])
+
+                    if fe_arr is not None:
+                        X_bm, _ = safe_add_constant(np.column_stack([core_m, fe_arr[mod_ok]]))
+                    else:
+                        X_bm, _ = safe_add_constant(core_m)
+                    try:
+                        res_bm = run_ols_clustered(y_m, X_bm, g_m)
+                        rec[f"n_ipo_mod_{mod_name}"] = int(pd.Series(g_m).nunique())
+                        rec[f"r2_mod_{mod_name}"]    = res_bm.rsquared
+                        # MOD main effect at param index N+1
+                        rec[f"coef_mod_{mod_name}"]  = res_bm.params[1 + n]
+                        rec[f"pval_mod_{mod_name}"]  = res_bm.pvalues[1 + n]
+                        for i, pc in enumerate(x_subset):
+                            rec[f"coef_{pc}_mod_{mod_name}"]   = res_bm.params[1 + i]
+                            rec[f"tstat_{pc}_mod_{mod_name}"]  = res_bm.tvalues[1 + i]
+                            rec[f"pvalue_{pc}_mod_{mod_name}"] = res_bm.pvalues[1 + i]
+                            # Interaction at param index N+2+i
+                            rec[f"coef_interact_{mod_name}_{pc}"]   = res_bm.params[1 + n + 1 + i]
+                            rec[f"tstat_interact_{mod_name}_{pc}"]  = res_bm.tvalues[1 + n + 1 + i]
+                            rec[f"pvalue_interact_{mod_name}_{pc}"] = res_bm.pvalues[1 + n + 1 + i]
+                    except Exception as e:
+                        rec[f"error_mod_{mod_name}_bi"] = str(e)
+
+                    # Moderation + controls spec
+                    if ctrl_arr is not None:
+                        ctrl_ok_m = mod_ok.copy()
+                        for j in range(ctrl_arr.shape[1]):
+                            ctrl_ok_m &= finite_mask(ctrl_arr[:, j])
+                        rec[f"n_obs_mod_{mod_name}_ctrl"] = int(ctrl_ok_m.sum())
+                        if ctrl_ok_m.sum() >= 15:
+                            y_mc    = y_arr[ctrl_ok_m]
+                            X_mc    = X_n[ctrl_ok_m] if n > 1 else X_n[ctrl_ok_m].reshape(-1, 1)
+                            mval_c  = mod_arr_full[ctrl_ok_m]
+                            ctrlv_m = ctrl_arr[ctrl_ok_m]
+                            g_mc    = sub.loc[ctrl_ok_m, "ipo_id"].values
+                            int_mc  = X_mc * mval_c[:, None]
+                            core_mc = np.column_stack([X_mc, mval_c[:, None], int_mc])
+                            _n_core_mc = core_mc.shape[1]   # = 2N+1
+                            if fe_arr is not None:
+                                _inner_mc = np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
+                            else:
+                                _inner_mc = np.column_stack([core_mc, ctrlv_m])
+                            X_mc_full, _keep_mc = safe_add_constant(_inner_mc)
+                            _ctrl_keep_mc = _keep_mc[_n_core_mc: _n_core_mc + len(ctrl_cols)]
+                            try:
+                                res_mc = run_ols_clustered(y_mc, X_mc_full, g_mc)
+                                rec[f"n_ipo_mod_{mod_name}_ctrl"] = int(pd.Series(g_mc).nunique())
+                                rec[f"r2_mod_{mod_name}_ctrl"]    = res_mc.rsquared
+                                # MOD main effect at index N+1
+                                rec[f"coef_mod_{mod_name}_ctrl"]  = res_mc.params[1 + n]
+                                rec[f"pval_mod_{mod_name}_ctrl"]  = res_mc.pvalues[1 + n]
+                                for i, pc in enumerate(x_subset):
+                                    rec[f"coef_{pc}_mod_{mod_name}_ctrl"]   = res_mc.params[1 + i]
+                                    rec[f"se_{pc}_mod_{mod_name}_ctrl"]     = res_mc.bse[1 + i]
+                                    rec[f"tstat_{pc}_mod_{mod_name}_ctrl"]  = res_mc.tvalues[1 + i]
+                                    rec[f"pvalue_{pc}_mod_{mod_name}_ctrl"] = res_mc.pvalues[1 + i]
+                                    # Interaction at index N+2+i
+                                    rec[f"coef_interact_{mod_name}_{pc}_ctrl"]   = res_mc.params[1 + n + 1 + i]
+                                    rec[f"se_interact_{mod_name}_{pc}_ctrl"]     = res_mc.bse[1 + n + 1 + i]
+                                    rec[f"tstat_interact_{mod_name}_{pc}_ctrl"]  = res_mc.tvalues[1 + n + 1 + i]
+                                    rec[f"pvalue_interact_{mod_name}_{pc}_ctrl"] = res_mc.pvalues[1 + n + 1 + i]
+                                _kept_i_mc = 0
+                                for j, cc in enumerate(ctrl_cols):
+                                    if _ctrl_keep_mc[j]:
+                                        rec[f"coef_{cc}_mod_{mod_name}_ctrl"] = res_mc.params[1 + _n_core_mc + _kept_i_mc]
+                                        rec[f"pval_{cc}_mod_{mod_name}_ctrl"] = res_mc.pvalues[1 + _n_core_mc + _kept_i_mc]
+                                        _kept_i_mc += 1
+                            except Exception as e:
+                                rec[f"error_mod_{mod_name}_ctrl"] = str(e)
+                        else:
+                            rec[f"error_mod_{mod_name}_ctrl"] = "too few obs after ctrl dropna"
+
                 records.append(rec)
         print(f"  group='{grp}' done")
     return pd.DataFrame(records)
@@ -771,9 +884,39 @@ def summarise(out, label, ctrl_cols, fe_cols):
 
 if PCA_MODE:
     _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+
+    # Merge 推介 verbal mods into car_grp for PCA mode (session-specific → use 推介 only)
+    if active_verbal_mods and verbal_mod_aggs:
+        _vmod_tui = verbal_mod_aggs.get(SESSION_推介)
+        if _vmod_tui is not None:
+            car_grp = car_grp.merge(_vmod_tui, on="ipo_id", how="left")
+
+    # Build unified mods config list: (mod_name, col_in_car_grp_after_merge)
+    # mkt is handled separately via mkt_mod flag; verbal/qa mods via all_mods_cfg
+    _pca_mods_cfg = []
+    for mod_name, mod_col in (active_qa_mods or {}).items():
+        col = f"qmod_{mod_col}"
+        if col in car_grp.columns:
+            _pca_mods_cfg.append((mod_name, col))
+        else:
+            print(f"  WARNING: QA mod col '{col}' not in car_grp — skipping {mod_name}")
+    for mod_name, mod_col in (active_verbal_mods or {}).items():
+        col = f"vmod_{mod_col}"
+        if col in car_grp.columns:
+            _pca_mods_cfg.append((mod_name, col))
+        else:
+            print(f"  WARNING: verbal mod col '{col}' not in car_grp — skipping {mod_name}")
+
     for y_group, y_cols in y_col_groups.items():
-        print(f"\n=== Running PCA cumulative {y_group} ({len(y_cols)} Y cols, {len(_pc_cols)} PCs) ===")
-        out = run_regressions_pca(car_grp, y_cols, _x_df, _pc_cols, ctrl_present, fe_cols)
+        _active_mods = [m[0] for m in _pca_mods_cfg] + (["mkt"] if MKT_MOD else [])
+        print(f"\n=== Running PCA cumulative {y_group} "
+              f"({len(y_cols)} Y cols, {len(_pc_cols)} PCs, "
+              f"mods={_active_mods}) ===")
+        out = run_regressions_pca(
+            car_grp, y_cols, _x_df, _pc_cols, ctrl_present, fe_cols,
+            mkt_mod=MKT_MOD, mkt_col=MKT_COL,
+            all_mods_cfg=_pca_mods_cfg,
+        )
         out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"Saved {len(out)} rows → {out_path}")
