@@ -34,6 +34,10 @@ def _parse_args():
                    help="Add market moderation: ret_4w_sh000300 + X*mkt interaction")
     p.add_argument("--pca",    action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
+    p.add_argument("--ife",    action=argparse.BooleanOptionalAction, default=False,
+                   help="Add CSRC industry fixed effects (csrc3 dummies)")
+    p.add_argument("--pltfe",  action=argparse.BooleanOptionalAction, default=False,
+                   help="Add board and platform fixed effects (board_fe, platform_fe)")
     return p.parse_args()
 
 _args = _parse_args()
@@ -43,6 +47,10 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 # ── Configuration ─────────────────────────────────────────────────────────────
 USE_CONTROLS  = True
 USE_FE        = True
+IFE_COL       = "csrc3"
+IND_FE        = _args.ife
+PLT_FE        = _args.pltfe
+PLT_FE_COLS   = ["board_fe", "platform_fe"]
 CTRL_COLS     = ["ipo_log_size", "ipo_pe_diluted", "ipo_shares_issued", "ipo_price", "duration"]
 WINSORIZE     = True
 WINSOR_BOUNDS = (0.01, 0.99)
@@ -83,13 +91,18 @@ car_meta = car.drop_duplicates("ipo_id")[["ipo_id", "event_year"]]
 
 ctrl_present = []
 if USE_CONTROLS:
-    _load_cols = ["ipo_id"] + CTRL_COLS + ([MKT_COL] if MKT_MOD else [])
+    _ind_load = [IFE_COL] if IND_FE else []
+    _plt_load = PLT_FE_COLS if PLT_FE else []
+    _load_cols = ["ipo_id"] + CTRL_COLS + ([MKT_COL] if MKT_MOD else []) + _ind_load + _plt_load
     ctrl_src = pd.read_csv(
         ROOT / "carv/output/car_cav_windows_controls.csv",
         usecols=lambda c: c in _load_cols,
     )
     ctrl_present = [c for c in CTRL_COLS if c in ctrl_src.columns]
-    _agg_cols = ctrl_present + ([MKT_COL] if MKT_MOD and MKT_COL in ctrl_src.columns else [])
+    _plt_fe_present = [c for c in _plt_load if c in ctrl_src.columns]
+    _agg_cols = ctrl_present + ([MKT_COL] if MKT_MOD and MKT_COL in ctrl_src.columns else []) + \
+                ([IFE_COL] if IND_FE and IFE_COL in ctrl_src.columns else []) + \
+                _plt_fe_present
     ipo_controls = ctrl_src.groupby("ipo_id")[_agg_cols].first().reset_index()
     print(f"IPO controls: {len(ipo_controls)} IPOs, cols: {ctrl_present}")
     car_meta = car_meta.merge(ipo_controls, on="ipo_id", how="left")
@@ -176,6 +189,18 @@ def _drop_const_cols(mat):
     keep = np.std(mat, axis=0) > 0
     return mat[:, keep], keep
 
+def _platform_fe_dummies(series):
+    """Multi-hot encode comma-separated platform strings into per-platform binary columns."""
+    all_plats = sorted({p.strip() for s in series.dropna() for p in str(s).split(",") if p.strip()})
+    mat = np.zeros((len(series), len(all_plats)), dtype=float)
+    for i, val in enumerate(series):
+        if pd.notna(val):
+            for p in str(val).split(","):
+                p = p.strip()
+                if p in all_plats:
+                    mat[i, all_plats.index(p)] = 1.0
+    return mat
+
 def safe_add_constant(mat):
     """Prepend intercept after dropping zero-variance columns.
 
@@ -194,7 +219,8 @@ def safe_add_constant(mat):
     return X, keep
 
 def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
-                    mkt_mod=False, mkt_col=None):
+                    mkt_mod=False, mkt_col=None, ind_fe=False, ind_col=None,
+                    plt_fe_cols=None):
     records = []
     for sess_label, src_dict in session_variants.items():
         for src, (x_df, x_cols) in src_dict.items():
@@ -202,13 +228,24 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
             for grp in ("am", "pm"):
                 sub = merged[merged["group"] == grp].reset_index(drop=True)
 
+                fe_parts = []
                 if use_fe and "event_year" in sub.columns:
-                    yr_dum = pd.get_dummies(
-                        sub["event_year"], prefix="yr", drop_first=True
-                    ).astype(float)
-                    yr_arr = yr_dum.values
-                else:
-                    yr_arr = None
+                    fe_parts.append(
+                        pd.get_dummies(sub["event_year"], prefix="yr", drop_first=True).astype(float).values
+                    )
+                if ind_fe and ind_col and ind_col in sub.columns:
+                    fe_parts.append(
+                        pd.get_dummies(sub[ind_col], prefix="ind", drop_first=True).astype(float).values
+                    )
+                for _pfe in (plt_fe_cols or []):
+                    if _pfe in sub.columns:
+                        if _pfe == "platform_fe":
+                            fe_parts.append(_platform_fe_dummies(sub[_pfe]))
+                        else:
+                            fe_parts.append(
+                                pd.get_dummies(sub[_pfe], prefix=_pfe, drop_first=True).astype(float).values
+                            )
+                yr_arr = np.column_stack(fe_parts) if fe_parts else None
 
                 mkt_arr_full = None
                 if mkt_mod and mkt_col and mkt_col in sub.columns:
@@ -347,7 +384,8 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
 
-def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe):
+def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe,
+                        ind_fe=False, ind_col=None, plt_fe_cols=None):
     """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs)."""
     records = []
     merged = qa_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
@@ -355,10 +393,24 @@ def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe):
     for grp in ("am", "pm"):
         sub = merged[merged["group"] == grp].reset_index(drop=True)
 
-        yr_arr = None
+        fe_parts = []
         if use_fe and "event_year" in sub.columns:
-            yr_dum = pd.get_dummies(sub["event_year"], prefix="yr", drop_first=True).astype(float)
-            yr_arr = yr_dum.values
+            fe_parts.append(
+                pd.get_dummies(sub["event_year"], prefix="yr", drop_first=True).astype(float).values
+            )
+        if ind_fe and ind_col and ind_col in sub.columns:
+            fe_parts.append(
+                pd.get_dummies(sub[ind_col], prefix="ind", drop_first=True).astype(float).values
+            )
+        for _pfe in (plt_fe_cols or []):
+            if _pfe in sub.columns:
+                if _pfe == "platform_fe":
+                    fe_parts.append(_platform_fe_dummies(sub[_pfe]))
+                else:
+                    fe_parts.append(
+                        pd.get_dummies(sub[_pfe], prefix=_pfe, drop_first=True).astype(float).values
+                    )
+        yr_arr = np.column_stack(fe_parts) if fe_parts else None
 
         ctrl_arr = None
         if ctrl_cols:
@@ -468,15 +520,20 @@ def summarise(out, ctrl_cols, use_fe):
 
 # ── 6. Run & save ─────────────────────────────────────────────────────────────
 print(f"\n=== Running QA regression ({len(y_candidates)} Y cols) ===")
-_mkt_suffix = "_mkt" if MKT_MOD else ""
-_pca_suffix = "_pca" if PCA_MODE else ""
-out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_mkt_suffix}{_pca_suffix}.csv"
+_mkt_suffix   = "_mkt"   if MKT_MOD  else ""
+_ife_suffix   = "_ife"   if IND_FE   else ""
+_pca_suffix   = "_pca"   if PCA_MODE else ""
+_pltfe_suffix = "_pltfe" if PLT_FE   else ""
+out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_ife_suffix}{_mkt_suffix}{_pca_suffix}{_pltfe_suffix}.csv"
 if PCA_MODE:
     _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
-    out = run_regressions_pca(qa_grp, y_candidates, _x_df, _pc_cols, ctrl_present, USE_FE)
+    out = run_regressions_pca(qa_grp, y_candidates, _x_df, _pc_cols, ctrl_present, USE_FE,
+                              ind_fe=IND_FE, ind_col=IFE_COL,
+                              plt_fe_cols=_plt_fe_present if PLT_FE else None)
 else:
     out = run_regressions(qa_grp, y_candidates, session_variants, ctrl_present, USE_FE,
-                          mkt_mod=MKT_MOD, mkt_col=MKT_COL)
+                          mkt_mod=MKT_MOD, mkt_col=MKT_COL, ind_fe=IND_FE, ind_col=IFE_COL,
+                          plt_fe_cols=_plt_fe_present if PLT_FE else None)
     summarise(out, ctrl_present, USE_FE)
 out.to_csv(out_path, index=False, encoding="utf-8-sig")
 print(f"Saved {len(out)} rows → {out_path}")

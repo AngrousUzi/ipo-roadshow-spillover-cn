@@ -65,6 +65,8 @@ def _parse_args():
     p.add_argument("--pc",     action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--year-fe",action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--ind-fe", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--pltfe",  action=argparse.BooleanOptionalAction, default=False,
+                   help="Add board and platform fixed effects (board_fe, platform_fe)")
     p.add_argument("--mkt-mod",action=argparse.BooleanOptionalAction, default=False,
                    help="Add market moderation: ret_4w_sh000300 main effect + X*mkt interaction")
     p.add_argument("--winsor", action=argparse.BooleanOptionalAction, default=True,
@@ -109,6 +111,8 @@ USE_PAIR_CONTROL    = _args.pc      # sim_mda  (pair-level MDA similarity)
 YEAR_FE             = _args.year_fe # year fixed effects
 IND_FE              = _args.ind_fe  # industry fixed effects
 IND_COL             = "csrc3"       # column for IND_FE (CSRC 3-digit industry code)
+PLT_FE              = _args.pltfe   # board + platform fixed effects
+PLT_FE_COLS         = ["board_fe", "platform_fe"]
 MKT_MOD             = _args.mkt_mod # market moderation via ret_4w_sh000300
 MKT_COL             = "ret_4w_sh000300"  # market proxy for moderation
 WINSORIZE           = _args.winsor       # winsorize all continuous vars at [1 %, 99 %]
@@ -158,6 +162,7 @@ if USE_IPO_CONTROL:     _suffix_parts.append("ic")
 if USE_PAIR_CONTROL:    _suffix_parts.append("pc")
 if YEAR_FE:             _suffix_parts.append("yfe")
 if IND_FE:              _suffix_parts.append("ife")
+if PLT_FE:              _suffix_parts.append("pltfe")
 if MKT_MOD:             _suffix_parts.append("mkt")
 if WINSORIZE:           _suffix_parts.append("w99")
 if TOP_RIVALS is not None: _suffix_parts.append(f"top{TOP_RIVALS}")
@@ -209,6 +214,12 @@ if IND_FE:
         fe_cols.append(IND_COL)
     else:
         print(f"  WARNING: IND_COL='{IND_COL}' not found — IND_FE disabled")
+if PLT_FE:
+    for _c in PLT_FE_COLS:
+        if _c in _raw.columns:
+            fe_cols.append(_c)
+        else:
+            print(f"  WARNING: PLT_FE col '{_c}' not found — skipped")
 
 car_cols = [c for c in _raw.columns if c.startswith(("car_", "cav_"))]
 mkt_present = [MKT_COL] if MKT_MOD and MKT_COL in _raw.columns else []
@@ -351,6 +362,18 @@ def _drop_const_cols(mat):
     keep = np.std(mat, axis=0) > 0
     return mat[:, keep], keep
 
+def _platform_fe_dummies(series):
+    """Multi-hot encode comma-separated platform strings into per-platform binary columns."""
+    all_plats = sorted({p.strip() for s in series.dropna() for p in str(s).split(",") if p.strip()})
+    mat = np.zeros((len(series), len(all_plats)), dtype=float)
+    for i, val in enumerate(series):
+        if pd.notna(val):
+            for p in str(val).split(","):
+                p = p.strip()
+                if p in all_plats:
+                    mat[i, all_plats.index(p)] = 1.0
+    return mat
+
 def safe_add_constant(mat):
     """Prepend intercept after dropping zero-variance columns.
 
@@ -402,10 +425,13 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                 fe_parts = []
                 for fc in fe_cols:
                     if fc in sub.columns:
-                        dum = pd.get_dummies(
-                            sub[fc], prefix=fc, drop_first=True
-                        ).astype(np.float32)
-                        fe_parts.append(dum.values)
+                        if fc == "platform_fe":
+                            fe_parts.append(_platform_fe_dummies(sub[fc]).astype(np.float32))
+                        else:
+                            dum = pd.get_dummies(
+                                sub[fc], prefix=fc, drop_first=True
+                            ).astype(np.float32)
+                            fe_parts.append(dum.values)
                 fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
 
                 # Market proxy array (used when mkt_mod=True)
@@ -668,8 +694,11 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
         fe_parts = []
         for fc in fe_cols:
             if fc in sub.columns:
-                dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
-                fe_parts.append(dum.values)
+                if fc == "platform_fe":
+                    fe_parts.append(_platform_fe_dummies(sub[fc]).astype(np.float32))
+                else:
+                    dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
+                    fe_parts.append(dum.values)
         fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
 
         ctrl_arr = None
