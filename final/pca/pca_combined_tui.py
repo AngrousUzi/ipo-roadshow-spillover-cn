@@ -32,7 +32,7 @@ GROUPS = {
     "verbal": {
         "source": "analyze/output/verbal_sentiment.csv",
         "cols": [
-            "ann_positive_ratio", "ann_negative_ratio", "ann_tone_score",
+            "ann_positive_ratio", "ann_negative_ratio",
             "social_positive_ratio", "social_negative_ratio",
             "policy_pos_ratio", "policy_neg_ratio",
         ],
@@ -40,9 +40,10 @@ GROUPS = {
     "vocal": {
         "source": "analyze/output/vocal_features.csv",
         "cols": [
-            "f0_slope", "f0_range", "rms_dynamic_range", "rms_cv",
+            "f0_cv", "f0_slope", "f0_range", "rms_dynamic_range", "rms_cv",
             "articulation_rate", "speech_rate", "pause_rate", "mean_pause_duration",
         ],
+        "derived": {"f0_cv": ("f0_std", "f0_mean")},
     },
     "visual": {
         "source": "analyze/output/visual_gaze.csv",
@@ -67,13 +68,17 @@ def winsorize(arr: np.ndarray) -> np.ndarray:
     hi = np.nanpercentile(a, 99)
     return np.clip(a, lo, hi)
 
-def load_and_agg(path: Path, cols: list[str], session: str) -> pd.DataFrame:
+def load_and_agg(path: Path, cols: list[str], session: str,
+                 derived: dict | None = None) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["ipo_id"]   = df["file_stem"].str.split("_").str[0]
     df["_session"] = df["file_stem"].str.split("_").str[-1]
     df = df[df["_session"] == session]
     if "error" in df.columns:
         df = df[df["error"].isna() | (df["error"].astype(str).str.strip() == "")]
+    for dcol, (lhs, rhs) in (derived or {}).items():
+        if lhs in df.columns and rhs in df.columns:
+            df[dcol] = df[lhs] / df[rhs].replace(0, np.nan)
     present = [c for c in cols if c in df.columns]
     missing = [c for c in cols if c not in df.columns]
     if missing:
@@ -85,7 +90,8 @@ merged = None
 all_cols = []
 
 for gname, gcfg in GROUPS.items():
-    agg = load_and_agg(ROOT / gcfg["source"], gcfg["cols"], SESSION)
+    agg = load_and_agg(ROOT / gcfg["source"], gcfg["cols"], SESSION,
+                       gcfg.get("derived", {}))
     present_cols = [c for c in gcfg["cols"] if c in agg.columns]
     # prefix to avoid column name collisions across groups
     rename = {c: f"{gname}_{c}" for c in present_cols}

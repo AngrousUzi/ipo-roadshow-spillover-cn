@@ -3,11 +3,11 @@
 PCA of multi-modal roadshow features across four variable groups.
 
 Groups and their source columns:
-  VERBAL    : ann_positive_ratio, ann_negative_ratio, ann_tone_score,
+  VERBAL    : ann_positive_ratio, ann_negative_ratio,
               social_positive_ratio, social_negative_ratio,
               policy_pos_ratio, policy_neg_ratio
-  VOCAL     : f0_slope, f0_range, rms_dynamic_range, rms_cv,
-              articulation_rate, speech_rate, pause_rate, mean_pause_duration
+  VOCAL     : f0_cv (=f0_std/f0_mean), f0_slope, f0_range, rms_dynamic_range,
+              rms_cv, articulation_rate, speech_rate, pause_rate, mean_pause_duration
   VISUAL    : gaze_at_camera_ratio_10, gaze_x_mean, gaze_x_std,
               gaze_y_mean, gaze_y_std, head_frontal_ratio_10,
               head_pitch_mean, head_pitch_std, head_yaw_mean, head_yaw_std
@@ -54,7 +54,7 @@ GROUPS = {
     "verbal": {
         "source": "analyze/output/verbal_sentiment.csv",
         "cols": [
-            "ann_positive_ratio", "ann_negative_ratio", "ann_tone_score",
+            "ann_positive_ratio", "ann_negative_ratio",
             "social_positive_ratio", "social_negative_ratio",
             "policy_pos_ratio", "policy_neg_ratio",
         ],
@@ -62,9 +62,10 @@ GROUPS = {
     "vocal": {
         "source": "analyze/output/vocal_features.csv",
         "cols": [
-            "f0_slope", "f0_range", "rms_dynamic_range", "rms_cv",
+            "f0_cv", "f0_slope", "f0_range", "rms_dynamic_range", "rms_cv",
             "articulation_rate", "speech_rate", "pause_rate", "mean_pause_duration",
         ],
+        "derived": {"f0_cv": ("f0_std", "/", "f0_mean")},
     },
     "visual": {
         "source": "analyze/output/visual_gaze.csv",
@@ -112,6 +113,9 @@ for gname, gcfg in GROUPS.items():
     print(f"\n── {gname.upper()} ──")
 
     df_all = load_source(ROOT / gcfg["source"])
+    for dcol, (lhs, op, rhs) in gcfg.get("derived", {}).items():
+        if lhs in df_all.columns and rhs in df_all.columns:
+            df_all[dcol] = df_all[lhs] / df_all[rhs].replace(0, np.nan)
     cols   = [c for c in gcfg["cols"] if c in df_all.columns]
     missing = [c for c in gcfg["cols"] if c not in df_all.columns]
     if missing:
