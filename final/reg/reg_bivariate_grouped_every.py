@@ -97,6 +97,8 @@ def _parse_args():
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
     p.add_argument("--efa",             action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 EFA scores (final/pca/efa_scores_combined_tui.csv) as X instead of raw features")
+    p.add_argument("--max-pcs",    type=int, default=5,
+                   help="PCA/EFA mode: max number of cumulative factors to regress (default: 5)")
     p.add_argument("--group",      type=str, default=None,
                    help="PCA mode only: PC column to split into quantile groups (e.g. pc1, pc2, pc3)")
     p.add_argument("--group-size", type=int, default=5,
@@ -131,6 +133,7 @@ WINSOR_BOUNDS       = (0.01, 0.99)
 TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim_mda (None = all)
 PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
 EFA_MODE            = _args.efa          # use 推介 EFA scores as X features
+MAX_PCS             = _args.max_pcs      # cap cumulative PC/factor loop in PCA/EFA mode
 GROUP_COL           = _args.group if (_args.pca or _args.efa) else None
 GROUP_SIZE          = _args.group_size   # number of quantile groups
 PLS_MODE            = _args.pls          # use PLS latent score instead of raw X
@@ -1323,7 +1326,8 @@ def run_regressions_pls_combined(car_grp, y_cols, pls_combined_data, ctrl_cols, 
 
 def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
                          mkt_mod=False, mkt_col=None, all_mods_cfg=None,
-                         group_col="group", group_values=("am", "pm")):
+                         group_col="group", group_values=("am", "pm"),
+                         max_pcs=None):
     """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs).
     SE clustered at ipo_id level (peer-level data).
 
@@ -1373,12 +1377,13 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
 
         for y_col in y_cols:
             y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+            n_max = min(len(pc_cols), max_pcs) if max_pcs else len(pc_cols)
             X_all = np.column_stack([
                 maybe_winsorize_x(sub[pc].to_numpy(dtype=float, na_value=np.nan))
-                for pc in pc_cols
+                for pc in pc_cols[:n_max]
             ])
 
-            for n in range(1, len(pc_cols) + 1):
+            for n in range(1, n_max + 1):
                 x_subset = pc_cols[:n]
                 X_n = X_all[:, :n]
 
@@ -1631,6 +1636,7 @@ if PCA_MODE or EFA_MODE:
             mkt_mod=MKT_MOD, mkt_col=MKT_COL,
             all_mods_cfg=_pca_mods_cfg,
             group_col=_group_col, group_values=_group_values,
+            max_pcs=MAX_PCS,
         )
         out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")

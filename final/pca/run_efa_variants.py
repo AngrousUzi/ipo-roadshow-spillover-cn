@@ -40,7 +40,7 @@ ALL_VARIANTS = [
 EVERY_BASE_ARGS = [
     "--rc1", "--rc2", "--no-rc3", "--ic", "--pc",
     "--year-fe", "--ind-fe", "--pltfe", "--no-winsor-x", "--efa",
-    "--a-pros-qa-mod",
+    "--a-pros-qa-mod", "--max-pcs", "5",
 ]
 
 MEAN_ARGS = ["--ife", "--efa", "--pltfe"]
