@@ -17,18 +17,18 @@ import numpy as np
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 
-# factor_analyzer uses the deprecated `force_all_finite` kwarg removed in sklearn 1.6;
-# patch check_array before importing factor_analyzer so it still works.
+from factor_analyzer import FactorAnalyzer
+from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+
+# factor_analyzer imports check_array directly, so patch its own module reference.
 import sklearn.utils.validation as _skv
+import factor_analyzer.factor_analyzer as _fa_mod
 _orig_check_array = _skv.check_array
 def _patched_check_array(*args, **kwargs):
     if "force_all_finite" in kwargs:
         kwargs.setdefault("ensure_all_finite", kwargs.pop("force_all_finite"))
     return _orig_check_array(*args, **kwargs)
-_skv.check_array = _patched_check_array
-
-from factor_analyzer import FactorAnalyzer
-from factor_analyzer.factor_analyzer import calculate_kmo, calculate_bartlett_sphericity
+_fa_mod.check_array = _patched_check_array
 
 
 def _parse_args():
