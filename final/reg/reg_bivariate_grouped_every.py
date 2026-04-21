@@ -351,7 +351,7 @@ session_variants = {s: {} for s in _active_sessions}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
     session_variants[SESSION_推介][name] = (agg_tui, xcols)
-    if not PCA_MODE:
+    if not PCA_MODE and not EFA_MODE:  # no second session in PCA/EFA mode
         agg_da, _ = load_agg(ROOT / rel, session_filter=SESSION_答谢)
         session_variants[SESSION_答谢][name] = (agg_da, xcols)
         print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, {len(xcols)} X cols")
