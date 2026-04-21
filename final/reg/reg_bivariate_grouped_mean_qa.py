@@ -85,7 +85,7 @@ PLS_FEATURE_COLS = {
 SESSION_推介 = "推介"
 SESSION_答谢 = "答谢"
 
-_active_sessions = [SESSION_推介] if (PCA_MODE or EFA_MODE) else [SESSION_推介, SESSION_答谢, "mean"]
+_active_sessions = [SESSION_推介]
 
 # ── 1. Load QA analysis → Y variables (IPO-level mean) ───────────────────────
 qa_raw = pd.read_csv(ROOT / "analyze/output/qa_analysis.csv")
@@ -189,15 +189,8 @@ session_variants = {s: {} for s in _active_sessions}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
     session_variants[SESSION_推介][name] = (agg_tui, xcols)
-    if not PCA_MODE:
-        agg_da,  _ = load_agg(ROOT / rel, session_filter=SESSION_答谢)
-        agg_avg, _ = load_agg(ROOT / rel, session_filter=None)
-        session_variants[SESSION_答谢][name] = (agg_da,  xcols)
-        session_variants["mean"][name]       = (agg_avg, xcols)
-        print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
-    else:
-        mode_tag = "PCA" if PCA_MODE else "EFA"
-        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols ({mode_tag} mode)")
+    mode_tag = "PCA" if PCA_MODE else ("EFA" if EFA_MODE else "raw")
+    print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols ({mode_tag} mode)")
 
 # ── PLS: whitelist filter + cross-dimension combined build ──────────────────
 if PLS_MODE:
