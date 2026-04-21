@@ -138,7 +138,7 @@ ipo_base = ipo_base.drop(columns=["_stkcd_str", "Stkcd"])
 print(f"After linking Retnfstd: non-null={ipo_base['Retnfstd'].notna().sum()} of {len(ipo_base)}")
 
 # ── 3. Roadshow start time → am / pm group ────────────────────────────────────
-_ann_dir = ROOT / "anns" if _os.name == "nt" else ROOT / "../cninf-ann-scraper"
+_ann_dir = ROOT / "anns" if _os.name == "nt" else ROOT / "../"
 idx = pd.read_excel(_ann_dir / "IPO_index.xlsx", usecols=["INDEX2009", "开始时间"])
 idx_sub = idx[["INDEX2009", "开始时间"]].copy()
 idx_sub.columns = ["ipo_id", "start_time"]
