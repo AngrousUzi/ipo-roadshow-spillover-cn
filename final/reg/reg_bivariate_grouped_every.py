@@ -45,9 +45,11 @@ Outputs (suffix encodes active modes):
 """
 
 import argparse
+import concurrent.futures
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+from sklearn.cross_decomposition import PLSRegression
 import warnings
 from pathlib import Path
 
@@ -97,6 +99,12 @@ def _parse_args():
                    help="PCA mode only: PC column to split into quantile groups (e.g. pc1, pc2, pc3)")
     p.add_argument("--group-size", type=int, default=5,
                    help="Number of quantile groups when --group is active (default: 5)")
+    p.add_argument("--pls",        action=argparse.BooleanOptionalAction, default=False,
+                   help="Use PLS regression: project X onto latent components via PLSRegression, "
+                        "then run OLS with clustered SE on the score(s). Works in both raw and PCA mode.")
+    p.add_argument("--pls-ncomp",  type=int, default=1,
+                   help="Number of PLS latent components to extract and use in cumulative regressions "
+                        "(default: 1). Like PCA cumulative mode: Y~pls1, Y~pls1+pls2, etc.")
     return p.parse_args()
 
 _args = _parse_args()
@@ -122,6 +130,36 @@ TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim
 PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
 GROUP_COL           = _args.group if _args.pca else None  # PC column to quantile-split (PCA mode only)
 GROUP_SIZE          = _args.group_size   # number of quantile groups
+PLS_MODE            = _args.pls          # use PLS latent score instead of raw X
+PLS_NCOMP           = _args.pls_ncomp   # number of PLS components (cumulative regression)
+
+# ── PLS feature whitelist (mirrors pca_combined_tui.py GROUPS) ────────────────
+# These are the UN-prefixed column names in each source CSV that the PCA uses.
+# When --pls is active, only these columns are fed to PLSRegression so that
+# the latent score is conceptually comparable to the PCA scores.
+PLS_FEATURE_COLS = {
+    "verbal": [
+        "ann_positive_ratio", "ann_negative_ratio",
+        "social_positive_ratio", "social_negative_ratio",
+    ],
+    "vocal": [
+        # f0_cv = f0_std / f0_mean (coefficient of variation) is derived in pca_combined_tui.py,
+        # but the raw CSV only has f0_std and f0_mean separately. We pass them as-is;
+        # PLSRegression(scale=True) finds the optimal linear combination, which is equivalent.
+        "f0_std", "f0_mean",
+        "f0_slope", "f0_range", "rms_dynamic_range", "rms_cv",
+        "articulation_rate", "pause_rate",
+    ],
+    "visual": [
+        "gaze_at_camera_ratio_10", "gaze_x_mean", "gaze_x_std",
+        "gaze_y_mean", "gaze_y_std", "head_frontal_ratio_10",
+        "head_pitch_mean", "head_pitch_std", "head_yaw_mean", "head_yaw_std",
+    ],
+    "visual_fer": [
+        "positive_ratio", "negative_ratio", "neutral_ratio",
+        "emo_happy", "emo_neutral", "emo_sad",
+    ],
+}
 
 RIVAL_CONTROL_1 = ["log_size", "bm", "roa", "leverage"]
 RIVAL_CONTROL_2 = ["age_listed", "age_estab"]
@@ -167,6 +205,7 @@ if MKT_MOD:             _suffix_parts.append("mkt")
 if WINSORIZE:           _suffix_parts.append("w99")
 if TOP_RIVALS is not None: _suffix_parts.append(f"top{TOP_RIVALS}")
 if PCA_MODE:            _suffix_parts.append("pca")
+if PLS_MODE:            _suffix_parts.append(f"pls{PLS_NCOMP}")
 if GROUP_COL is not None: _suffix_parts.append(f"grp_{GROUP_COL}_{GROUP_SIZE}")
 for k in active_verbal_mods: _suffix_parts.append(k)
 for k in active_qa_mods:     _suffix_parts.append(k)
@@ -312,6 +351,42 @@ for name, rel in sources.items():
     else:
         print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
 
+# ── 3c. When --pls: restrict x_cols to PCA feature whitelist ─────────────────
+if PLS_MODE:
+    for sess_label in session_variants:
+        for src_name in list(session_variants[sess_label].keys()):
+            x_df, x_cols = session_variants[sess_label][src_name]
+            whitelist = PLS_FEATURE_COLS.get(src_name)
+            if whitelist is not None:
+                x_cols_pls = [c for c in x_cols if c in whitelist]
+                skipped    = [c for c in x_cols if c not in whitelist]
+                if skipped:
+                    print(f"  [PLS] {src_name}/{sess_label}: dropped {len(skipped)} non-PCA cols, "
+                          f"keeping {len(x_cols_pls)}: {x_cols_pls}")
+                session_variants[sess_label][src_name] = (x_df, x_cols_pls)
+            # If source not in PLS_FEATURE_COLS (e.g. 'pca' which can't happen
+            # since --pls and --pca are mutually exclusive), leave untouched.
+
+# ── 3d. When --pls: build combined cross-dimension feature DF per session ─────────
+# Inner-join all 4 sources by ipo_id; prefix col names with src_ to avoid clashes.
+# pls_combined_data: {sess_label: (combined_df, list_of_prefixed_col_names)}
+pls_combined_data = {}
+if PLS_MODE:
+    for sess_label in session_variants:
+        comb_df    = None
+        comb_cols  = []
+        for src_name, (x_df, x_cols) in session_variants[sess_label].items():
+            if not x_cols:
+                continue
+            rename    = {c: f"{src_name}_{c}" for c in x_cols}
+            df_pref   = x_df[["ipo_id"] + x_cols].rename(columns=rename)
+            comb_cols.extend(rename[c] for c in x_cols)
+            comb_df = df_pref if comb_df is None else comb_df.merge(df_pref, on="ipo_id", how="inner")
+        if comb_df is not None:
+            pls_combined_data[sess_label] = (comb_df, comb_cols)
+            print(f"  [PLS combined] {sess_label}: {len(comb_df)} IPOs, "
+                  f"{len(comb_cols)} features across all dimensions")
+
 # ── 3b. Build verbal moderator aggregations (per session, from verbal source) ─
 verbal_mod_aggs = {}
 if active_verbal_mods:
@@ -339,6 +414,48 @@ print(f"\nPeer rows after group filter: {len(car_grp)} "
 # ── 5. Regression engine ──────────────────────────────────────────────────────
 def run_ols_clustered(y_c, X_mat, groups):
     return sm.OLS(y_c, X_mat).fit(cov_type="cluster", cov_kwds={"groups": groups})
+
+def _pls_score(y_b, X_b):
+    """Fit PLSRegression(n_components=1) on (X_b, y_b) and return the X latent score (N,).
+
+    The score is the projection of X onto the first PLS component direction that
+    maximises covariance with y.  We then run OLS with clustered SE on this
+    single score so that all downstream inference is identical to the OLS path.
+    """
+    pls = PLSRegression(n_components=1, scale=True)
+    pls.fit(X_b, y_b)
+    x_score = pls.transform(X_b).ravel()      # (N, 1) → (N,)
+    return x_score
+
+def run_reg(y_c, X_mat, groups):
+    """Run OLS with clustered SE — the single entry-point for all regression calls.
+
+    When PLS_MODE is active the caller is expected to have already replaced X_mat
+    with [const, pls_score, (controls/FE)] via _make_pls_Xmat(); this function
+    itself is always plain OLS so that clustered SE is preserved.
+    """
+    return run_ols_clustered(y_c, X_mat, groups)
+
+def _make_pls_Xmat(y_b, x_raw_b, extra_b=None):
+    """Build X matrix for PLS+OLS path.
+
+    1. Fit PLS on (x_raw_b, y_b) to obtain a single latent score.
+    2. Return safe_add_constant([score, extra_b]) where extra_b is
+       optional (controls / FE columns already stacked).
+
+    Parameters
+    ----------
+    y_b      : 1-D array of outcome values (used to supervise PLS).
+    x_raw_b  : 2-D array (N, K) of raw predictors passed to PLS.
+    extra_b  : 2-D array (N, M) of additional columns (ctrl + FE), or None.
+
+    Returns
+    -------
+    X_mat : design matrix with intercept prepended, keep mask.
+    """
+    score = _pls_score(y_b, x_raw_b.reshape(len(y_b), -1))
+    inner = score.reshape(-1, 1) if extra_b is None else np.column_stack([score, extra_b])
+    return safe_add_constant(inner)
 
 def finite_mask(arr):
     """Boolean mask: not-null and finite for numeric arrays."""
@@ -418,8 +535,8 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
             if vmod_df is not None:
                 merged = merged.merge(vmod_df, on="ipo_id", how="left")
 
-            for grp in ("am", "pm"):
-                sub = merged[merged["group"] == grp].reset_index(drop=True)
+            for grp in ("am", "pm", "all"):
+                sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
 
                 # Build combined FE array once per (session, source, group)
                 fe_parts = []
@@ -432,6 +549,8 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                                 sub[fc], prefix=fc, drop_first=True
                             ).astype(np.float32)
                             fe_parts.append(dum.values)
+                if grp == "all" and "group" in sub.columns:
+                    fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
                 fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
 
                 # Market proxy array (used when mkt_mod=True)
@@ -665,6 +784,537 @@ def run_regressions(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
                         records.append(rec)
         print(f"  session='{sess_label}' done")
     return pd.DataFrame(records)
+
+
+def run_regressions_pls(car_grp, y_cols, session_variants, ctrl_cols, fe_cols,
+                        qa_mods=None, verbal_mods=None, verbal_mod_aggs=None):
+    """PLS regression variant of run_regressions.
+
+    For each (session, source, group, y_col) ALL x_cols in the source are fed
+    simultaneously into PLSRegression(n_components=1, scale=True) which finds
+    the single latent direction maximising cov(X, y).  The resulting score is
+    then used as the sole predictor in OLS with ipo_id-clustered SE.
+
+    Produces ONE record per (session, src, group, y_col), not one per x_col.
+    Output column layout mirrors run_regressions:
+      coef / se / tstat / pvalue / r2           (bivariate + FE)
+      coef_ctrl / ... / r2_ctrl                 (with controls + FE)
+      Per active moderator: same coef_x_mod_* / coef_interact_* / ... fields.
+    Extra field: n_x_cols  — number of raw X columns fed to PLS.
+    """
+    records = []
+    for sess_label, src_dict in session_variants.items():
+        vmod_df = None
+        if verbal_mods and verbal_mod_aggs:
+            vmod_df = verbal_mod_aggs.get(sess_label)
+
+        for src, (x_df, x_cols) in src_dict.items():
+            merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
+            if vmod_df is not None:
+                merged = merged.merge(vmod_df, on="ipo_id", how="left")
+
+            for grp in ("am", "pm", "all"):
+                sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
+
+                # Build FE array
+                fe_parts = []
+                for fc in fe_cols:
+                    if fc in sub.columns:
+                        if fc == "platform_fe":
+                            fe_parts.append(_platform_fe_dummies(sub[fc]).astype(np.float32))
+                        else:
+                            dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
+                            fe_parts.append(dum.values)
+                if grp == "all" and "group" in sub.columns:
+                    fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
+                fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
+
+                # Build ctrl array
+                ctrl_arr = None
+                if ctrl_cols:
+                    ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32).copy()
+                    for j in range(ctrl_arr.shape[1]):
+                        ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+                # Moderator column list
+                all_mods_cfg = []
+                for mod_name, mod_col in (qa_mods or {}).items():
+                    col = f"qmod_{mod_col}"
+                    if col in sub.columns:
+                        all_mods_cfg.append((mod_name, col))
+                for mod_name, mod_col in (verbal_mods or {}).items():
+                    col = f"vmod_{mod_col}"
+                    if col in sub.columns:
+                        all_mods_cfg.append((mod_name, col))
+
+                for y_col in y_cols:
+                    y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+
+                    # Stack ALL X columns into a (N, K) matrix
+                    X_raw = np.column_stack([
+                        maybe_winsorize_x(sub[xc].to_numpy(dtype=float, na_value=np.nan))
+                        for xc in x_cols
+                    ])
+
+                    # Base validity mask: y finite AND every X column finite
+                    base_ok = finite_mask(y_arr)
+                    for j in range(X_raw.shape[1]):
+                        base_ok &= finite_mask(X_raw[:, j])
+                    if base_ok.sum() < 15:
+                        continue
+
+                    y_b = y_arr[base_ok]
+                    X_b = X_raw[base_ok]          # (n, K)
+                    g_b = sub.loc[base_ok, "ipo_id"].values
+
+                    rec = {
+                        "session":   sess_label,
+                        "group":     grp,
+                        "y_col":     y_col,
+                        "x_source":  src,
+                        "x_col":     "pls_score",
+                        "n_x_cols":  len(x_cols),
+                    }
+
+                    # ── Bivariate PLS ──────────────────────────────────────────
+                    extra_bi = fe_arr[base_ok] if fe_arr is not None else None
+                    try:
+                        X_bi, _ = _make_pls_Xmat(y_b, X_b, extra_b=extra_bi)
+                        res_bi  = run_ols_clustered(y_b, X_bi, g_b)
+                        rec.update({
+                            "n_obs":  int(base_ok.sum()),
+                            "n_ipo":  int(pd.Series(g_b).nunique()),
+                            "const":  res_bi.params[0],
+                            "coef":   res_bi.params[1],
+                            "se":     res_bi.bse[1],
+                            "tstat":  res_bi.tvalues[1],
+                            "pvalue": res_bi.pvalues[1],
+                            "r2":     res_bi.rsquared,
+                        })
+                    except Exception as e:
+                        rec["error_bi"] = str(e)
+
+                    # ── With controls PLS ──────────────────────────────────────
+                    if ctrl_arr is not None:
+                        ctrl_ok = base_ok.copy()
+                        for j in range(ctrl_arr.shape[1]):
+                            ctrl_ok &= finite_mask(ctrl_arr[:, j])
+                        y_c2  = y_arr[ctrl_ok]
+                        X_c2  = X_raw[ctrl_ok]
+                        ctrlv = ctrl_arr[ctrl_ok]
+                        g_c2  = sub.loc[ctrl_ok, "ipo_id"].values
+                        rec["n_obs_ctrl"] = int(ctrl_ok.sum())
+                        rec["n_ipo_ctrl"] = int(pd.Series(g_c2).nunique())
+                        if ctrl_ok.sum() >= 15:
+                            extra_ct = (
+                                np.column_stack([ctrlv, fe_arr[ctrl_ok]])
+                                if fe_arr is not None else ctrlv
+                            )
+                            try:
+                                X_ctrl, _keep_ct = _make_pls_Xmat(y_c2, X_c2, extra_b=extra_ct)
+                                # Layout after safe_add_constant:
+                                #   params[0]=intercept  params[1]=pls_score
+                                #   params[2..]=extra_ct kept cols (ctrl first, then FE)
+                                # _keep_ct covers [pls_score | ctrl | FE] before intercept
+                                # _keep_ct[0]=score (always True), [1:1+K_ctrl]=ctrl
+                                _ctrl_keep_ct = _keep_ct[1: 1 + len(ctrl_cols)]
+                                res_ct = run_ols_clustered(y_c2, X_ctrl, g_c2)
+                                rec.update({
+                                    "coef_ctrl":   res_ct.params[1],
+                                    "se_ctrl":     res_ct.bse[1],
+                                    "tstat_ctrl":  res_ct.tvalues[1],
+                                    "pvalue_ctrl": res_ct.pvalues[1],
+                                    "r2_ctrl":     res_ct.rsquared,
+                                })
+                                _kept_i = 0
+                                for i, cc in enumerate(ctrl_cols):
+                                    if _ctrl_keep_ct[i]:
+                                        rec[f"coef_{cc}"] = res_ct.params[2 + _kept_i]
+                                        rec[f"pval_{cc}"] = res_ct.pvalues[2 + _kept_i]
+                                        _kept_i += 1
+                            except Exception as e:
+                                rec["error_ctrl"] = str(e)
+                        else:
+                            rec["error_ctrl"] = "too few obs after ctrl dropna"
+
+                    # ── Moderations ────────────────────────────────────────────
+                    # PLS score is re-fitted per moderation sub-sample so that
+                    # the latent direction is always supervised by y on that sample.
+                    for mod_name, mod_col in all_mods_cfg:
+                        mod_arr_full = maybe_winsorize(
+                            sub[mod_col].to_numpy(dtype=float, na_value=np.nan)
+                        )
+                        mod_ok = base_ok & finite_mask(mod_arr_full)
+                        rec[f"n_obs_mod_{mod_name}"] = int(mod_ok.sum())
+                        if mod_ok.sum() < 15:
+                            continue
+
+                        y_m  = y_arr[mod_ok]
+                        X_m  = X_raw[mod_ok]
+                        mval = mod_arr_full[mod_ok]
+                        g_m  = sub.loc[mod_ok, "ipo_id"].values
+
+                        # Fit PLS on this sub-sample → score → interact with mod
+                        try:
+                            score_m    = _pls_score(y_m, X_m)   # (n_mod,)
+                            interact_m = score_m * mval
+                            core_m     = np.column_stack([score_m, mval, interact_m])
+                            extra_mod  = (
+                                np.column_stack([core_m, fe_arr[mod_ok]])
+                                if fe_arr is not None else core_m
+                            )
+                            X_bm, _ = safe_add_constant(extra_mod)
+                            res_bm  = run_ols_clustered(y_m, X_bm, g_m)
+                            # params: [0]=const [1]=score [2]=mod [3]=score*mod [4+]=FE
+                            rec.update({
+                                f"n_ipo_mod_{mod_name}":          int(pd.Series(g_m).nunique()),
+                                f"coef_x_mod_{mod_name}":         res_bm.params[1],
+                                f"coef_mod_{mod_name}":           res_bm.params[2],
+                                f"pval_mod_{mod_name}":           res_bm.pvalues[2],
+                                f"coef_interact_{mod_name}":      res_bm.params[3],
+                                f"se_interact_{mod_name}":        res_bm.bse[3],
+                                f"tstat_interact_{mod_name}":     res_bm.tvalues[3],
+                                f"pvalue_interact_{mod_name}":    res_bm.pvalues[3],
+                                f"r2_mod_{mod_name}":             res_bm.rsquared,
+                            })
+                        except Exception as e:
+                            rec[f"error_mod_{mod_name}"] = str(e)
+
+                        # Moderation + controls
+                        if ctrl_arr is not None:
+                            ctrl_ok_m = mod_ok.copy()
+                            for j in range(ctrl_arr.shape[1]):
+                                ctrl_ok_m &= finite_mask(ctrl_arr[:, j])
+                            rec[f"n_obs_mod_{mod_name}_ctrl"] = int(ctrl_ok_m.sum())
+                            if ctrl_ok_m.sum() >= 15:
+                                y_mc    = y_arr[ctrl_ok_m]
+                                X_mc    = X_raw[ctrl_ok_m]
+                                mval_c  = mod_arr_full[ctrl_ok_m]
+                                ctrlv_m = ctrl_arr[ctrl_ok_m]
+                                g_mc    = sub.loc[ctrl_ok_m, "ipo_id"].values
+                                try:
+                                    score_mc    = _pls_score(y_mc, X_mc)
+                                    interact_mc = score_mc * mval_c
+                                    core_mc     = np.column_stack([score_mc, mval_c, interact_mc])
+                                    # extra_mc layout: [score(1) | mod(1) | interact(1) | ctrl(K) | FE(*)]
+                                    extra_mc = (
+                                        np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
+                                        if fe_arr is not None
+                                        else np.column_stack([core_mc, ctrlv_m])
+                                    )
+                                    X_mc_full, _keep_mc = safe_add_constant(extra_mc)
+                                    # _keep_mc[0..2]=score/mod/interact, [3:3+K_ctrl]=ctrl
+                                    _ctrl_keep_mc = _keep_mc[3: 3 + len(ctrl_cols)]
+                                    res_mc = run_ols_clustered(y_mc, X_mc_full, g_mc)
+                                    rec.update({
+                                        f"n_ipo_mod_{mod_name}_ctrl":       int(pd.Series(g_mc).nunique()),
+                                        f"coef_x_mod_{mod_name}_ctrl":      res_mc.params[1],
+                                        f"coef_mod_{mod_name}_ctrl":        res_mc.params[2],
+                                        f"pval_mod_{mod_name}_ctrl":        res_mc.pvalues[2],
+                                        f"coef_interact_{mod_name}_ctrl":   res_mc.params[3],
+                                        f"se_interact_{mod_name}_ctrl":     res_mc.bse[3],
+                                        f"tstat_interact_{mod_name}_ctrl":  res_mc.tvalues[3],
+                                        f"pvalue_interact_{mod_name}_ctrl": res_mc.pvalues[3],
+                                        f"r2_mod_{mod_name}_ctrl":          res_mc.rsquared,
+                                    })
+                                    _kept_i_mc = 0
+                                    for j, cc in enumerate(ctrl_cols):
+                                        if _ctrl_keep_mc[j]:
+                                            rec[f"coef_{cc}_mod_{mod_name}"] = res_mc.params[4 + _kept_i_mc]
+                                            rec[f"pval_{cc}_mod_{mod_name}"] = res_mc.pvalues[4 + _kept_i_mc]
+                                            _kept_i_mc += 1
+                                except Exception as e:
+                                    rec[f"error_mod_{mod_name}_ctrl"] = str(e)
+                            else:
+                                rec[f"error_mod_{mod_name}_ctrl"] = "too few obs after ctrl dropna"
+
+                    records.append(rec)
+            print(f"  session='{sess_label}' done (PLS)")
+    return pd.DataFrame(records)
+
+
+def run_regressions_pls_combined(car_grp, y_cols, pls_combined_data, ctrl_cols, fe_cols,
+                                  pls_ncomp=1, qa_mods=None, verbal_mods=None,
+                                  verbal_mod_aggs=None):
+    """Cross-dimension PLS regression (replaces per-source run_regressions_pls).
+
+    For each (session, group, y_col):
+      1. Combine ALL PLS_FEATURE_COLS from all sources into one (N, K) X matrix.
+      2. Fit PLSRegression(n_components=pls_ncomp, scale=True) supervised by Y.
+      3. Extract scores matrix S (N, pls_ncomp).
+      4. Run CUMULATIVE OLS with clustered SE:
+           n=1: Y ~ pls1          [+ ctrl + FE]
+           n=2: Y ~ pls1 + pls2   [+ ctrl + FE]
+           ...  up to pls_ncomp
+
+    Output: one record per (session, group, y_col, n_pls).  Same column layout
+    as run_regressions_pca (coef_plsN / se_plsN / tstat_plsN / pvalue_plsN).
+    Moderators use PLS score 1 only (pls1 * MOD interaction) for interpretability.
+    """
+    records = []
+    for sess_label, (x_df_comb, all_pls_cols) in pls_combined_data.items():
+        merged = car_grp.merge(x_df_comb, on="ipo_id", how="inner").reset_index(drop=True)
+
+        # Attach verbal mods
+        if verbal_mods and verbal_mod_aggs:
+            vmod_df = verbal_mod_aggs.get(sess_label)
+            if vmod_df is not None:
+                merged = merged.merge(vmod_df, on="ipo_id", how="left")
+
+        for grp in ("am", "pm", "all"):
+            sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
+
+            # Build FE array
+            fe_parts = []
+            for fc in fe_cols:
+                if fc in sub.columns:
+                    if fc == "platform_fe":
+                        fe_parts.append(_platform_fe_dummies(sub[fc]).astype(np.float32))
+                    else:
+                        dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
+                        fe_parts.append(dum.values)
+            if grp == "all" and "group" in sub.columns:
+                fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
+            fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
+
+            # Build ctrl array
+            ctrl_arr = None
+            if ctrl_cols:
+                ctrl_arr = sub[ctrl_cols].to_numpy(dtype=np.float32).copy()
+                for j in range(ctrl_arr.shape[1]):
+                    ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+            # Moderator list
+            all_mods_cfg = []
+            for mod_name, mod_col in (qa_mods or {}).items():
+                col = f"qmod_{mod_col}"
+                if col in sub.columns:
+                    all_mods_cfg.append((mod_name, col))
+            for mod_name, mod_col in (verbal_mods or {}).items():
+                col = f"vmod_{mod_col}"
+                if col in sub.columns:
+                    all_mods_cfg.append((mod_name, col))
+
+            for y_col in y_cols:
+                y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+
+                # Combined X matrix (N, K) across ALL dimensions
+                X_raw = np.column_stack([
+                    maybe_winsorize_x(sub[c].to_numpy(dtype=float, na_value=np.nan))
+                    for c in all_pls_cols
+                ])
+
+                # Base validity mask
+                base_ok = finite_mask(y_arr)
+                for j in range(X_raw.shape[1]):
+                    base_ok &= finite_mask(X_raw[:, j])
+                if base_ok.sum() < 15:
+                    continue
+
+                y_b = y_arr[base_ok]
+                X_b = X_raw[base_ok]              # (n_base, K)
+                g_b = sub.loc[base_ok, "ipo_id"].values
+
+                # Fit PLS ONCE on base subsample; get all pls_ncomp scores
+                actual_ncomp = min(pls_ncomp, X_b.shape[1], X_b.shape[0] - 1)
+                try:
+                    pls_model = PLSRegression(n_components=actual_ncomp, scale=True)
+                    pls_model.fit(X_b, y_b)
+                    scores_b = pls_model.transform(X_b)   # (n_base, actual_ncomp)
+                    scores_b = np.atleast_2d(scores_b) if scores_b.ndim == 1 else scores_b
+                except Exception as e:
+                    continue  # PLS fitting failed for this (group, y_col)
+
+                pls_names = [f"pls{i+1}" for i in range(actual_ncomp)]
+
+                # Pre-compute index helper: base_ok positions in sub
+                base_ok_pos = np.where(base_ok)[0]
+
+                # Cumulative regressions: n = 1, 2, ..., actual_ncomp
+                for n in range(1, actual_ncomp + 1):
+                    x_subset = pls_names[:n]
+                    S_b = scores_b[:, :n]          # (n_base, n)
+
+                    rec = {
+                        "session":      sess_label,
+                        "group":        grp,
+                        "y_col":        y_col,
+                        "n_pls":        n,
+                        "n_x_cols":     len(all_pls_cols),
+                        "x_cols_pls":   ",".join(x_subset),
+                    }
+
+                    # ── Bivariate (± FE) ──────────────────────────────────────────
+                    if fe_arr is not None:
+                        X_bi, _ = safe_add_constant(np.column_stack([S_b, fe_arr[base_ok]]))
+                    else:
+                        X_bi, _ = safe_add_constant(S_b)
+                    try:
+                        res_bi = run_ols_clustered(y_b, X_bi, g_b)
+                        rec["n_obs"] = int(base_ok.sum())
+                        rec["n_ipo"] = int(pd.Series(g_b).nunique())
+                        rec["r2"]    = res_bi.rsquared
+                        for i, pn in enumerate(x_subset):
+                            rec[f"coef_{pn}"]   = res_bi.params[1 + i]
+                            rec[f"se_{pn}"]     = res_bi.bse[1 + i]
+                            rec[f"tstat_{pn}"]  = res_bi.tvalues[1 + i]
+                            rec[f"pvalue_{pn}"] = res_bi.pvalues[1 + i]
+                    except Exception as e:
+                        rec["error_bi"] = str(e)
+
+                    # ── With controls ──────────────────────────────────────────
+                    if ctrl_arr is not None:
+                        ctrl_ok = base_ok.copy()
+                        for j in range(ctrl_arr.shape[1]):
+                            ctrl_ok &= finite_mask(ctrl_arr[:, j])
+                        g_c = sub.loc[ctrl_ok, "ipo_id"].values
+                        rec["n_obs_ctrl"] = int(ctrl_ok.sum())
+                        rec["n_ipo_ctrl"] = int(pd.Series(g_c).nunique())
+                        if ctrl_ok.sum() >= 15:
+                            # Map ctrl_ok to scores_b row indices
+                            ctrl_ok_pos = np.where(ctrl_ok)[0]
+                            in_base = np.isin(base_ok_pos, ctrl_ok_pos)
+                            y_c   = y_arr[ctrl_ok]
+                            S_c   = scores_b[in_base, :n]
+                            ctrlv = ctrl_arr[ctrl_ok]
+                            if fe_arr is not None:
+                                _inner = np.column_stack([S_c, ctrlv, fe_arr[ctrl_ok]])
+                            else:
+                                _inner = np.column_stack([S_c, ctrlv])
+                            X_ctrl, _keep = safe_add_constant(_inner)
+                            _ctrl_keep = _keep[n: n + len(ctrl_cols)]
+                            try:
+                                res_ct = run_ols_clustered(y_c, X_ctrl, g_c)
+                                rec["r2_ctrl"] = res_ct.rsquared
+                                for i, pn in enumerate(x_subset):
+                                    rec[f"coef_{pn}_ctrl"]   = res_ct.params[1 + i]
+                                    rec[f"se_{pn}_ctrl"]     = res_ct.bse[1 + i]
+                                    rec[f"tstat_{pn}_ctrl"]  = res_ct.tvalues[1 + i]
+                                    rec[f"pvalue_{pn}_ctrl"] = res_ct.pvalues[1 + i]
+                                _kept_i = 0
+                                for j, cc in enumerate(ctrl_cols):
+                                    if _ctrl_keep[j]:
+                                        rec[f"coef_{cc}_ctrl"] = res_ct.params[1 + n + _kept_i]
+                                        rec[f"pval_{cc}_ctrl"] = res_ct.pvalues[1 + n + _kept_i]
+                                        _kept_i += 1
+                            except Exception as e:
+                                rec["error_ctrl"] = str(e)
+                        else:
+                            rec["error_ctrl"] = "too few obs after ctrl dropna"
+
+                    # ── Moderation (pls1 × MOD, bivariate + ctrl) ───────────────────
+                    # Re-fit PLS(n=n) on mod subsample so the latent direction is
+                    # always supervised by y on that exact sample.
+                    for mod_name, mod_col in all_mods_cfg:
+                        mod_arr_full = maybe_winsorize(
+                            sub[mod_col].to_numpy(dtype=float, na_value=np.nan)
+                        )
+                        mod_ok = base_ok & finite_mask(mod_arr_full)
+                        rec[f"n_obs_mod_{mod_name}"] = int(mod_ok.sum())
+                        if mod_ok.sum() < 15:
+                            continue
+
+                        y_m  = y_arr[mod_ok]
+                        X_m  = X_raw[mod_ok]
+                        mval = mod_arr_full[mod_ok]
+                        g_m  = sub.loc[mod_ok, "ipo_id"].values
+                        try:
+                            pls_m = PLSRegression(n_components=min(n, X_m.shape[1], X_m.shape[0]-1),
+                                                  scale=True)
+                            pls_m.fit(X_m, y_m)
+                            S_m = pls_m.transform(X_m)          # (n_mod, n)
+                            if S_m.ndim == 1:
+                                S_m = S_m.reshape(-1, 1)
+                            S_m = S_m[:, :n]
+                            # Use pls1 score for the interaction term
+                            score_m1    = S_m[:, 0]
+                            interact_m  = score_m1 * mval
+                            core_m = np.column_stack([S_m, mval, interact_m])
+                            # param layout: const(0) pls1..plsN(1..n) mod(n+1) pls1*mod(n+2) FE
+                            extra_mod = (
+                                np.column_stack([core_m, fe_arr[mod_ok]])
+                                if fe_arr is not None else core_m
+                            )
+                            X_bm, _ = safe_add_constant(extra_mod)
+                            res_bm  = run_ols_clustered(y_m, X_bm, g_m)
+                            rec.update({
+                                f"n_ipo_mod_{mod_name}":          int(pd.Series(g_m).nunique()),
+                                f"coef_mod_{mod_name}":           res_bm.params[1 + n],
+                                f"pval_mod_{mod_name}":           res_bm.pvalues[1 + n],
+                                f"coef_interact_{mod_name}":      res_bm.params[2 + n],
+                                f"se_interact_{mod_name}":        res_bm.bse[2 + n],
+                                f"tstat_interact_{mod_name}":     res_bm.tvalues[2 + n],
+                                f"pvalue_interact_{mod_name}":    res_bm.pvalues[2 + n],
+                                f"r2_mod_{mod_name}":             res_bm.rsquared,
+                            })
+                            for i, pn in enumerate(x_subset):
+                                rec[f"coef_{pn}_mod_{mod_name}"]  = res_bm.params[1 + i]
+                                rec[f"tstat_{pn}_mod_{mod_name}"] = res_bm.tvalues[1 + i]
+                                rec[f"pvalue_{pn}_mod_{mod_name}"]= res_bm.pvalues[1 + i]
+                        except Exception as e:
+                            rec[f"error_mod_{mod_name}"] = str(e)
+
+                        # Moderation + controls
+                        if ctrl_arr is not None:
+                            ctrl_ok_m = mod_ok.copy()
+                            for j in range(ctrl_arr.shape[1]):
+                                ctrl_ok_m &= finite_mask(ctrl_arr[:, j])
+                            rec[f"n_obs_mod_{mod_name}_ctrl"] = int(ctrl_ok_m.sum())
+                            if ctrl_ok_m.sum() >= 15:
+                                y_mc    = y_arr[ctrl_ok_m]
+                                X_mc    = X_raw[ctrl_ok_m]
+                                mval_c  = mod_arr_full[ctrl_ok_m]
+                                ctrlv_m = ctrl_arr[ctrl_ok_m]
+                                g_mc    = sub.loc[ctrl_ok_m, "ipo_id"].values
+                                try:
+                                    _nc_m = min(n, X_mc.shape[1], X_mc.shape[0]-1)
+                                    pls_mc = PLSRegression(n_components=_nc_m, scale=True)
+                                    pls_mc.fit(X_mc, y_mc)
+                                    S_mc = pls_mc.transform(X_mc)[:, :n]
+                                    if S_mc.ndim == 1:
+                                        S_mc = S_mc.reshape(-1, 1)
+                                    score_mc1   = S_mc[:, 0]
+                                    interact_mc = score_mc1 * mval_c
+                                    core_mc = np.column_stack([S_mc, mval_c, interact_mc])
+                                    _n_core_mc = core_mc.shape[1]  # n + 2
+                                    extra_mcc = (
+                                        np.column_stack([core_mc, ctrlv_m, fe_arr[ctrl_ok_m]])
+                                        if fe_arr is not None
+                                        else np.column_stack([core_mc, ctrlv_m])
+                                    )
+                                    X_mc_full, _keep_mc = safe_add_constant(extra_mcc)
+                                    _ctrl_keep_mc = _keep_mc[_n_core_mc: _n_core_mc + len(ctrl_cols)]
+                                    res_mc = run_ols_clustered(y_mc, X_mc_full, g_mc)
+                                    rec.update({
+                                        f"n_ipo_mod_{mod_name}_ctrl":       int(pd.Series(g_mc).nunique()),
+                                        f"coef_mod_{mod_name}_ctrl":        res_mc.params[1 + n],
+                                        f"pval_mod_{mod_name}_ctrl":        res_mc.pvalues[1 + n],
+                                        f"coef_interact_{mod_name}_ctrl":   res_mc.params[2 + n],
+                                        f"se_interact_{mod_name}_ctrl":     res_mc.bse[2 + n],
+                                        f"tstat_interact_{mod_name}_ctrl":  res_mc.tvalues[2 + n],
+                                        f"pvalue_interact_{mod_name}_ctrl": res_mc.pvalues[2 + n],
+                                        f"r2_mod_{mod_name}_ctrl":          res_mc.rsquared,
+                                    })
+                                    for i, pn in enumerate(x_subset):
+                                        rec[f"coef_{pn}_mod_{mod_name}_ctrl"]  = res_mc.params[1 + i]
+                                        rec[f"se_{pn}_mod_{mod_name}_ctrl"]    = res_mc.bse[1 + i]
+                                        rec[f"tstat_{pn}_mod_{mod_name}_ctrl"] = res_mc.tvalues[1 + i]
+                                        rec[f"pvalue_{pn}_mod_{mod_name}_ctrl"]= res_mc.pvalues[1 + i]
+                                    _kept_i_mc = 0
+                                    for j, cc in enumerate(ctrl_cols):
+                                        if _ctrl_keep_mc[j]:
+                                            rec[f"coef_{cc}_mod_{mod_name}_ctrl"] = res_mc.params[1 + _n_core_mc + _kept_i_mc]
+                                            rec[f"pval_{cc}_mod_{mod_name}_ctrl"] = res_mc.pvalues[1 + _n_core_mc + _kept_i_mc]
+                                            _kept_i_mc += 1
+                                except Exception as e:
+                                    rec[f"error_mod_{mod_name}_ctrl"] = str(e)
+                            else:
+                                rec[f"error_mod_{mod_name}_ctrl"] = "too few obs after ctrl dropna"
+
+                    records.append(rec)
+            print(f"  group='{grp}' done (PLS combined, n_pls={actual_ncomp})")
+    return pd.DataFrame(records)
+
 
 def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
                          mkt_mod=False, mkt_col=None, all_mods_cfg=None,
@@ -965,7 +1615,7 @@ if PCA_MODE:
         print(f"Group mode: {GROUP_COL} → {GROUP_SIZE} quantile groups "
               f"({_ipo_grp['pc_group'].value_counts().sort_index().to_dict()})")
 
-    for y_group, y_cols in y_col_groups.items():
+    def _run_pca_group(y_group, y_cols):
         _active_mods = [m[0] for m in _pca_mods_cfg] + (["mkt"] if MKT_MOD else [])
         print(f"\n=== Running PCA cumulative {y_group} "
               f"({len(y_cols)} Y cols, {len(_pc_cols)} PCs, "
@@ -979,17 +1629,43 @@ if PCA_MODE:
         out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"Saved {len(out)} rows → {out_path}")
+
+    with concurrent.futures.ThreadPoolExecutor() as _pool:
+        _futs = [_pool.submit(_run_pca_group, yg, yc)
+                 for yg, yc in y_col_groups.items()]
+        for _f in concurrent.futures.as_completed(_futs):
+            _f.result()
 else:
-    for y_group, y_cols in y_col_groups.items():
-        print(f"\n=== Running {y_group} ({len(y_cols)} Y cols) ===")
-        out = run_regressions(
-            car_grp, y_cols, session_variants, ctrl_present, fe_cols,
-            mkt_mod=MKT_MOD, mkt_col=MKT_COL,
-            verbal_mods=active_verbal_mods if active_verbal_mods else None,
-            qa_mods=active_qa_mods     if active_qa_mods     else None,
-            verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
-        )
+    if PLS_MODE and PCA_MODE:
+        raise ValueError("--pls and --pca are mutually exclusive. "
+                         "PLS operates on raw X features; use --pls without --pca.")
+    def _run_group(y_group, y_cols):
+        _method = f"PLS (combined, ncomp={PLS_NCOMP})" if PLS_MODE else "OLS"
+        print(f"\n=== Running {_method} {y_group} ({len(y_cols)} Y cols) ===")
+        if PLS_MODE:
+            out = run_regressions_pls_combined(
+                car_grp, y_cols, pls_combined_data, ctrl_present, fe_cols,
+                pls_ncomp=PLS_NCOMP,
+                qa_mods=active_qa_mods     if active_qa_mods     else None,
+                verbal_mods=active_verbal_mods if active_verbal_mods else None,
+                verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
+            )
+        else:
+            out = run_regressions(
+                car_grp, y_cols, session_variants, ctrl_present, fe_cols,
+                mkt_mod=MKT_MOD, mkt_col=MKT_COL,
+                verbal_mods=active_verbal_mods if active_verbal_mods else None,
+                qa_mods=active_qa_mods     if active_qa_mods     else None,
+                verbal_mod_aggs=verbal_mod_aggs if active_verbal_mods else None,
+            )
         out_path = ROOT / f"final/reg/reg_bivariate_grouped_every_{y_group}{OUTPUT_SUFFIX}.csv"
         out.to_csv(out_path, index=False, encoding="utf-8-sig")
         print(f"Saved {len(out)} rows → {out_path}")
-        summarise(out, y_group, ctrl_present, fe_cols)
+        if not PLS_MODE:
+            summarise(out, y_group, ctrl_present, fe_cols)
+
+    with concurrent.futures.ThreadPoolExecutor() as _pool:
+        _futs = [_pool.submit(_run_group, yg, yc)
+                 for yg, yc in y_col_groups.items()]
+        for _f in concurrent.futures.as_completed(_futs):
+            _f.result()

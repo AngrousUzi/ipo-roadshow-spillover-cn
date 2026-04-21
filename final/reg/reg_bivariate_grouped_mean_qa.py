@@ -22,6 +22,7 @@ import argparse
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
+from sklearn.cross_decomposition import PLSRegression
 import warnings
 from pathlib import Path
 
@@ -38,6 +39,11 @@ def _parse_args():
                    help="Add CSRC industry fixed effects (csrc3 dummies)")
     p.add_argument("--pltfe",  action=argparse.BooleanOptionalAction, default=False,
                    help="Add board and platform fixed effects (board_fe, platform_fe)")
+    p.add_argument("--pls",      action=argparse.BooleanOptionalAction, default=False,
+                   help="Cross-dimension PLS: combine all PLS_FEATURE_COLS sources into one X matrix, "
+                        "fit PLSRegression, run cumulative OLS with HC3 SE.")
+    p.add_argument("--pls-ncomp", type=int, default=1,
+                   help="Number of PLS latent components for cumulative regression (default: 1).")
     return p.parse_args()
 
 _args = _parse_args()
@@ -57,6 +63,21 @@ WINSOR_BOUNDS = (0.01, 0.99)
 MKT_MOD       = _args.mkt_mod
 MKT_COL       = "ret_4w_sh000300"
 PCA_MODE      = _args.pca
+PLS_MODE      = _args.pls
+PLS_NCOMP     = _args.pls_ncomp
+
+# ── PLS feature whitelist (mirrors pca_combined_tui.py GROUPS) ────────────────
+PLS_FEATURE_COLS = {
+    "verbal":     ["ann_positive_ratio", "ann_negative_ratio",
+                   "social_positive_ratio", "social_negative_ratio"],
+    "vocal":      ["f0_std", "f0_mean", "f0_slope", "f0_range",
+                   "rms_dynamic_range", "rms_cv", "articulation_rate", "pause_rate"],
+    "visual":     ["gaze_at_camera_ratio_10", "gaze_x_mean", "gaze_x_std",
+                   "gaze_y_mean", "gaze_y_std", "head_frontal_ratio_10",
+                   "head_pitch_mean", "head_pitch_std", "head_yaw_mean", "head_yaw_std"],
+    "visual_fer": ["positive_ratio", "negative_ratio", "neutral_ratio",
+                   "emo_happy", "emo_neutral", "emo_sad"],
+}
 
 SESSION_推介 = "推介"
 SESSION_答谢 = "答谢"
@@ -74,6 +95,7 @@ y_candidates = [
     if c not in META_QA
     and pd.api.types.is_numeric_dtype(qa_raw[c])
 ]
+y_candidates = [c for c in y_candidates if c in {"qa_pairs", "n_unique_questioners"}]  # TEMP: restrict Y
 
 # Drop rows with errors
 if "error" in qa_raw.columns:
@@ -171,6 +193,33 @@ for name, rel in sources.items():
     else:
         print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
 
+# ── PLS: whitelist filter + cross-dimension combined build ──────────────────
+if PLS_MODE:
+    for sess_label in list(session_variants.keys()):
+        for src_name in list(session_variants[sess_label].keys()):
+            x_df, x_cols = session_variants[sess_label][src_name]
+            whitelist = PLS_FEATURE_COLS.get(src_name)
+            if whitelist is not None:
+                x_cols_pls = [c for c in x_cols if c in whitelist]
+                skipped    = [c for c in x_cols if c not in whitelist]
+                if skipped:
+                    print(f"  [PLS] {src_name}/{sess_label}: keeping {len(x_cols_pls)} PCA cols")
+                session_variants[sess_label][src_name] = (x_df, x_cols_pls)
+
+pls_combined_data = {}
+if PLS_MODE:
+    for sess_label in session_variants:
+        comb_df = None; comb_cols = []
+        for src_name, (x_df, x_cols) in session_variants[sess_label].items():
+            if not x_cols: continue
+            rename  = {c: f"{src_name}_{c}" for c in x_cols}
+            df_pref = x_df[["ipo_id"] + x_cols].rename(columns=rename)
+            comb_cols.extend(rename.values())
+            comb_df = df_pref if comb_df is None else comb_df.merge(df_pref, on="ipo_id", how="inner")
+        if comb_df is not None:
+            pls_combined_data[sess_label] = (comb_df, comb_cols)
+            print(f"  [PLS combined] {sess_label}: {len(comb_df)} IPOs, {len(comb_cols)} features")
+
 # ── 5. Regression engine ──────────────────────────────────────────────────────
 def run_ols_hc3(y_c, X_mat):
     return sm.OLS(y_c, X_mat).fit(cov_type="HC3")
@@ -225,8 +274,8 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
     for sess_label, src_dict in session_variants.items():
         for src, (x_df, x_cols) in src_dict.items():
             merged = qa_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
-            for grp in ("am", "pm"):
-                sub = merged[merged["group"] == grp].reset_index(drop=True)
+            for grp in ("am", "pm", "all"):
+                sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
 
                 fe_parts = []
                 if use_fe and "event_year" in sub.columns:
@@ -245,6 +294,8 @@ def run_regressions(qa_grp, y_cols, session_variants, ctrl_cols, use_fe,
                             fe_parts.append(
                                 pd.get_dummies(sub[_pfe], prefix=_pfe, drop_first=True).astype(float).values
                             )
+                if grp == "all" and "group" in sub.columns:
+                    fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
                 yr_arr = np.column_stack(fe_parts) if fe_parts else None
 
                 mkt_arr_full = None
@@ -390,8 +441,8 @@ def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe,
     records = []
     merged = qa_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
 
-    for grp in ("am", "pm"):
-        sub = merged[merged["group"] == grp].reset_index(drop=True)
+    for grp in ("am", "pm", "all"):
+        sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
 
         fe_parts = []
         if use_fe and "event_year" in sub.columns:
@@ -410,6 +461,8 @@ def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe,
                     fe_parts.append(
                         pd.get_dummies(sub[_pfe], prefix=_pfe, drop_first=True).astype(float).values
                     )
+        if grp == "all" and "group" in sub.columns:
+            fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
         yr_arr = np.column_stack(fe_parts) if fe_parts else None
 
         ctrl_arr = None
@@ -501,6 +554,135 @@ def run_regressions_pca(qa_grp, y_cols, x_df, pc_cols, ctrl_cols, use_fe,
     return pd.DataFrame(records)
 
 
+def run_regressions_pls_combined(qa_grp, y_cols, pls_combined_data, ctrl_cols, use_fe,
+                                  pls_ncomp=1, ind_fe=False, ind_col=None, plt_fe_cols=None):
+    """Cross-dimension PLS cumulative regression for QA data (HC3 SE).
+    Fits PLSRegression(n_components=pls_ncomp) per (session, group, y_col) subsample,
+    then runs cumulative OLS: Y~pls1, Y~pls1+pls2, ... with HC3 SE.
+    One record per (session, group, y_col, n_pls).
+    """
+    records = []
+    for sess_label, (x_df_comb, all_pls_cols) in pls_combined_data.items():
+        merged = qa_grp.merge(x_df_comb, on="ipo_id", how="inner").reset_index(drop=True)
+        for grp in ("am", "pm", "all"):
+            sub = (merged if grp == "all" else merged[merged["group"] == grp]).reset_index(drop=True)
+
+            fe_parts = []
+            if use_fe and "event_year" in sub.columns:
+                fe_parts.append(pd.get_dummies(sub["event_year"], prefix="yr",
+                                               drop_first=True).astype(float).values)
+            if ind_fe and ind_col and ind_col in sub.columns:
+                fe_parts.append(pd.get_dummies(sub[ind_col], prefix="ind",
+                                               drop_first=True).astype(float).values)
+            for _pfe in (plt_fe_cols or []):
+                if _pfe in sub.columns:
+                    if _pfe == "platform_fe":
+                        fe_parts.append(_platform_fe_dummies(sub[_pfe]))
+                    else:
+                        fe_parts.append(pd.get_dummies(sub[_pfe], prefix=_pfe,
+                                                       drop_first=True).astype(float).values)
+            if grp == "all" and "group" in sub.columns:
+                fe_parts.append((sub["group"] == "am").astype(float).values.reshape(-1, 1))
+            yr_arr = np.column_stack(fe_parts) if fe_parts else None
+
+            ctrl_arr = None
+            if ctrl_cols:
+                ctrl_arr = sub[ctrl_cols].to_numpy(dtype=float).copy()
+                for j in range(ctrl_arr.shape[1]):
+                    ctrl_arr[:, j] = maybe_winsorize(ctrl_arr[:, j])
+
+            for y_col in y_cols:
+                y_arr = maybe_winsorize(sub[y_col].to_numpy(dtype=float, na_value=np.nan))
+                X_raw = np.column_stack([
+                    maybe_winsorize(sub[c].to_numpy(dtype=float, na_value=np.nan))
+                    for c in all_pls_cols
+                ])
+                base_ok = finite_mask(y_arr)
+                for j in range(X_raw.shape[1]):
+                    base_ok &= finite_mask(X_raw[:, j])
+                if base_ok.sum() < 15:
+                    continue
+
+                y_b = y_arr[base_ok]
+                X_b = X_raw[base_ok]
+                actual_ncomp = min(pls_ncomp, X_b.shape[1], X_b.shape[0] - 1)
+                try:
+                    pls_model = PLSRegression(n_components=actual_ncomp, scale=True)
+                    pls_model.fit(X_b, y_b)
+                    scores_b = pls_model.transform(X_b)
+                    if scores_b.ndim == 1:
+                        scores_b = scores_b.reshape(-1, 1)
+                except Exception:
+                    continue
+
+                pls_names   = [f"pls{i+1}" for i in range(actual_ncomp)]
+                base_ok_pos = np.where(base_ok)[0]
+
+                for n in range(1, actual_ncomp + 1):
+                    x_subset = pls_names[:n]
+                    S_b      = scores_b[:, :n]
+                    rec = {
+                        "session":    sess_label, "group":   grp,
+                        "y_col":      y_col,      "n_pls":   n,
+                        "n_x_cols":   len(all_pls_cols),
+                        "x_cols_pls": ",".join(x_subset),
+                    }
+
+                    if use_fe and yr_arr is not None:
+                        X_bi, _ = safe_add_constant(np.column_stack([S_b, yr_arr[base_ok]]))
+                    else:
+                        X_bi, _ = safe_add_constant(S_b)
+                    try:
+                        res_bi = run_ols_hc3(y_b, X_bi)
+                        rec["n_obs"] = int(base_ok.sum())
+                        rec["r2"]    = res_bi.rsquared
+                        for i, pn in enumerate(x_subset):
+                            rec[f"coef_{pn}"]   = res_bi.params[1 + i]
+                            rec[f"se_{pn}"]     = res_bi.bse[1 + i]
+                            rec[f"tstat_{pn}"]  = res_bi.tvalues[1 + i]
+                            rec[f"pvalue_{pn}"] = res_bi.pvalues[1 + i]
+                    except Exception as e:
+                        rec["error_bi"] = str(e)
+
+                    if ctrl_arr is not None:
+                        ctrl_ok = base_ok.copy()
+                        for j in range(ctrl_arr.shape[1]):
+                            ctrl_ok &= finite_mask(ctrl_arr[:, j])
+                        rec["n_obs_ctrl"] = int(ctrl_ok.sum())
+                        if ctrl_ok.sum() >= 15:
+                            in_base = np.isin(base_ok_pos, np.where(ctrl_ok)[0])
+                            y_c     = y_arr[ctrl_ok]
+                            S_c     = scores_b[in_base, :n]
+                            ctrlv   = ctrl_arr[ctrl_ok]
+                            if use_fe and yr_arr is not None:
+                                _inner = np.column_stack([S_c, ctrlv, yr_arr[ctrl_ok]])
+                            else:
+                                _inner = np.column_stack([S_c, ctrlv])
+                            X_ctrl, _keep = safe_add_constant(_inner)
+                            _ctrl_keep = _keep[n: n + len(ctrl_cols)]
+                            try:
+                                res_ct = run_ols_hc3(y_c, X_ctrl)
+                                rec["r2_ctrl"] = res_ct.rsquared
+                                for i, pn in enumerate(x_subset):
+                                    rec[f"coef_{pn}_ctrl"]   = res_ct.params[1 + i]
+                                    rec[f"se_{pn}_ctrl"]     = res_ct.bse[1 + i]
+                                    rec[f"tstat_{pn}_ctrl"]  = res_ct.tvalues[1 + i]
+                                    rec[f"pvalue_{pn}_ctrl"] = res_ct.pvalues[1 + i]
+                                _kept_i = 0
+                                for j, cc in enumerate(ctrl_cols):
+                                    if _ctrl_keep[j]:
+                                        rec[f"coef_{cc}_ctrl"] = res_ct.params[1 + n + _kept_i]
+                                        rec[f"pval_{cc}_ctrl"] = res_ct.pvalues[1 + n + _kept_i]
+                                        _kept_i += 1
+                            except Exception as e:
+                                rec["error_ctrl"] = str(e)
+                        else:
+                            rec["error_ctrl"] = "too few obs after ctrl dropna"
+                    records.append(rec)
+            print(f"  group='{grp}' done (PLS combined, n_pls={actual_ncomp})")
+    return pd.DataFrame(records)
+
+
 def summarise(out, ctrl_cols, use_fe):
     fe_tag = "+FE" if use_fe else ""
     res_ok = out[out["pvalue"].notna()].copy()
@@ -523,17 +705,26 @@ print(f"\n=== Running QA regression ({len(y_candidates)} Y cols) ===")
 _mkt_suffix   = "_mkt"   if MKT_MOD  else ""
 _ife_suffix   = "_ife"   if IND_FE   else ""
 _pca_suffix   = "_pca"   if PCA_MODE else ""
+_pls_suffix   = f"_pls{PLS_NCOMP}" if PLS_MODE else ""
 _pltfe_suffix = "_pltfe" if PLT_FE   else ""
-out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_ife_suffix}{_mkt_suffix}{_pca_suffix}{_pltfe_suffix}.csv"
+out_path = ROOT / f"final/reg/reg_bivariate_grouped_mean_qa_ctrl_fe{_ife_suffix}{_mkt_suffix}{_pca_suffix}{_pls_suffix}{_pltfe_suffix}.csv"
+if PCA_MODE and PLS_MODE:
+    raise ValueError("--pca and --pls are mutually exclusive")
 if PCA_MODE:
     _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
     out = run_regressions_pca(qa_grp, y_candidates, _x_df, _pc_cols, ctrl_present, USE_FE,
                               ind_fe=IND_FE, ind_col=IFE_COL,
                               plt_fe_cols=_plt_fe_present if PLT_FE else None)
+elif PLS_MODE:
+    out = run_regressions_pls_combined(
+        qa_grp, y_candidates, pls_combined_data, ctrl_present, USE_FE,
+        pls_ncomp=PLS_NCOMP, ind_fe=IND_FE, ind_col=IFE_COL,
+        plt_fe_cols=_plt_fe_present if PLT_FE else None,
+    )
 else:
     out = run_regressions(qa_grp, y_candidates, session_variants, ctrl_present, USE_FE,
                           mkt_mod=MKT_MOD, mkt_col=MKT_COL, ind_fe=IND_FE, ind_col=IFE_COL,
                           plt_fe_cols=_plt_fe_present if PLT_FE else None)
     summarise(out, ctrl_present, USE_FE)
 out.to_csv(out_path, index=False, encoding="utf-8-sig")
-print(f"Saved {len(out)} rows → {out_path}")
+print(f"Saved {len(out)} rows \u2192 {out_path}")
