@@ -39,6 +39,8 @@ def _parse_args():
                    help="Add market moderation: ret_4w_sh000300 + X*mkt interaction")
     p.add_argument("--pca",    action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
+    p.add_argument("--efa",    action=argparse.BooleanOptionalAction, default=False,
+                   help="Use 推介 EFA scores (final/pca/efa_scores_combined_tui.csv) as X instead of raw features")
     p.add_argument("--ife",    action=argparse.BooleanOptionalAction, default=False,
                    help="Add CSRC industry fixed effects (csrc3 dummies)")
     p.add_argument("--pltfe",  action=argparse.BooleanOptionalAction, default=False,
@@ -66,6 +68,7 @@ WINSOR_BOUNDS = (0.01, 0.99)   # winsorize all variables at [1 %, 99 %]
 MKT_MOD       = _args.mkt_mod
 MKT_COL       = "ret_4w_sh000300"
 PCA_MODE      = _args.pca
+EFA_MODE      = _args.efa
 PLS_MODE      = _args.pls
 PLS_NCOMP     = _args.pls_ncomp
 
@@ -85,7 +88,7 @@ PLS_FEATURE_COLS = {
 SESSION_推介 = "推介"
 SESSION_答谢 = "答谢"
 
-_active_sessions = [SESSION_推介] if PCA_MODE else [SESSION_推介, SESSION_答谢, "mean"]
+_active_sessions = [SESSION_推介] if (PCA_MODE or EFA_MODE) else [SESSION_推介, SESSION_答谢, "mean"]
 
 # ── 1. Load IPO-level base table from controls CSV ────────────────────────────
 _raw = pd.read_csv(ROOT / "carv/output/car_cav_windows_controls.csv")
@@ -158,6 +161,8 @@ sources = {
 }
 if PCA_MODE:
     sources = {"pca": "final/pca/pca_scores_combined_tui.csv"}
+elif EFA_MODE:
+    sources = {"efa": "final/pca/efa_scores_combined_tui.csv"}
 
 def load_agg(path, session_filter=None):
     df = pd.read_csv(path)
@@ -185,7 +190,8 @@ for name, rel in sources.items():
         session_variants["mean"][name]       = (agg_avg, xcols)
         print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, mean={len(agg_avg)}, {len(xcols)} X cols")
     else:
-        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
+        mode_tag = "PCA" if PCA_MODE else "EFA"
+        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols ({mode_tag} mode)")
 
 # ── PLS: whitelist filter + cross-dimension combined build ──────────────────
 if PLS_MODE:
@@ -712,15 +718,16 @@ def summarise(out, ctrl_cols):
 y_cols_all = ["Retnfstd"] + _extra_y
 _mkt_suffix   = "_mkt"   if MKT_MOD else ""
 _ife_suffix   = "_ife"   if IND_FE  else ""
-_pca_suffix   = "_pca"   if PCA_MODE else ""
+_pca_suffix   = "_pca"   if PCA_MODE else ("_efa" if EFA_MODE else "")
 _pls_suffix   = f"_pls{PLS_NCOMP}" if PLS_MODE else ""
 _pltfe_suffix = "_pltfe" if PLT_FE  else ""
 OUTPUT_PATH = ROOT / f"final/reg/reg_bivariate_grouped_mean_firstday_ic_yfe{_ife_suffix}{_mkt_suffix}{_pca_suffix}{_pls_suffix}{_pltfe_suffix}.csv"
 print(f"\n=== Running firstday regressions: {y_cols_all} ===")
-if PCA_MODE and PLS_MODE:
-    raise ValueError("--pca and --pls are mutually exclusive")
-if PCA_MODE:
-    _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+if sum([bool(PCA_MODE), bool(EFA_MODE), bool(PLS_MODE)]) > 1:
+    raise ValueError("--pca, --efa, and --pls are mutually exclusive")
+if PCA_MODE or EFA_MODE:
+    _src_key = "pca" if PCA_MODE else "efa"
+    _x_df, _pc_cols = session_variants[SESSION_推介][_src_key]
     out = run_regressions_pca(base_grp, y_cols_all, _x_df, _pc_cols, ctrl_present, USE_FE,
                               ind_fe=IND_FE, ind_col=IFE_COL,
                               plt_fe_cols=_plt_fe_present if PLT_FE else None)

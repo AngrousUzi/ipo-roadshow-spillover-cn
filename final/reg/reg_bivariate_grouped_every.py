@@ -95,6 +95,8 @@ def _parse_args():
                    help="Moderation by qa_pairs (Q&A count) from qa_analysis.csv (IPO-level)")
     p.add_argument("--pca",             action=argparse.BooleanOptionalAction, default=False,
                    help="Use 推介 PCA scores (final/pca/pca_scores_推介.csv) as X instead of raw features")
+    p.add_argument("--efa",             action=argparse.BooleanOptionalAction, default=False,
+                   help="Use 推介 EFA scores (final/pca/efa_scores_combined_tui.csv) as X instead of raw features")
     p.add_argument("--group",      type=str, default=None,
                    help="PCA mode only: PC column to split into quantile groups (e.g. pc1, pc2, pc3)")
     p.add_argument("--group-size", type=int, default=5,
@@ -128,7 +130,8 @@ WINSORIZE_X         = _args.winsor_x and _args.winsor  # winsorize X (main predi
 WINSOR_BOUNDS       = (0.01, 0.99)
 TOP_RIVALS          = _args.top_rivals   # keep only top-N rivals per IPO by sim_mda (None = all)
 PCA_MODE            = _args.pca          # use 推介 PCA scores as X features
-GROUP_COL           = _args.group if _args.pca else None  # PC column to quantile-split (PCA mode only)
+EFA_MODE            = _args.efa          # use 推介 EFA scores as X features
+GROUP_COL           = _args.group if (_args.pca or _args.efa) else None
 GROUP_SIZE          = _args.group_size   # number of quantile groups
 PLS_MODE            = _args.pls          # use PLS latent score instead of raw X
 PLS_NCOMP           = _args.pls_ncomp   # number of PLS components (cumulative regression)
@@ -205,6 +208,7 @@ if MKT_MOD:             _suffix_parts.append("mkt")
 if WINSORIZE:           _suffix_parts.append("w99")
 if TOP_RIVALS is not None: _suffix_parts.append(f"top{TOP_RIVALS}")
 if PCA_MODE:            _suffix_parts.append("pca")
+if EFA_MODE:            _suffix_parts.append("efa")
 if PLS_MODE:            _suffix_parts.append(f"pls{PLS_NCOMP}")
 if GROUP_COL is not None: _suffix_parts.append(f"grp_{GROUP_COL}_{GROUP_SIZE}")
 for k in active_verbal_mods: _suffix_parts.append(k)
@@ -319,9 +323,10 @@ sources = {
     "visual":     "analyze/output/visual_gaze.csv",
     "visual_fer": "analyze/output/visual_fer.csv",
 }
-# When --pca, replace sources with pre-computed combined-dimension 推介 PCA scores
 if PCA_MODE:
     sources = {"pca": "final/pca/pca_scores_combined_tui.csv"}
+elif EFA_MODE:
+    sources = {"efa": "final/pca/efa_scores_combined_tui.csv"}
 
 def load_agg(path, session_filter=None):
     df = pd.read_csv(path)
@@ -338,8 +343,7 @@ def load_agg(path, session_filter=None):
     ]
     return df.groupby("ipo_id")[xcols].mean().reset_index(), xcols
 
-# When --pca, only 推介 session is available (PCA was fit on 推介 only)
-_active_sessions = [SESSION_推介] if PCA_MODE else [SESSION_推介, SESSION_答谢]
+_active_sessions = [SESSION_推介] if (PCA_MODE or EFA_MODE) else [SESSION_推介, SESSION_答谢]
 session_variants = {s: {} for s in _active_sessions}
 for name, rel in sources.items():
     agg_tui, xcols = load_agg(ROOT / rel, session_filter=SESSION_推介)
@@ -349,7 +353,8 @@ for name, rel in sources.items():
         session_variants[SESSION_答谢][name] = (agg_da, xcols)
         print(f"{name}: 推介={len(agg_tui)}, 答谢={len(agg_da)}, {len(xcols)} X cols")
     else:
-        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols (PCA mode)")
+        mode_tag = "PCA" if PCA_MODE else "EFA"
+        print(f"{name}: 推介={len(agg_tui)}, {len(xcols)} X cols ({mode_tag} mode)")
 
 # ── 3c. When --pls: restrict x_cols to PCA feature whitelist ─────────────────
 if PLS_MODE:
@@ -391,7 +396,7 @@ if PLS_MODE:
 verbal_mod_aggs = {}
 if active_verbal_mods:
     _verbal_path = ROOT / "analyze/output/verbal_sentiment.csv"
-    _verbal_sessions = [SESSION_推介, SESSION_答谢] if not PCA_MODE else [SESSION_推介]
+    _verbal_sessions = [SESSION_推介, SESSION_答谢] if not (PCA_MODE or EFA_MODE) else [SESSION_推介]
     _verbal_cache = {s: load_agg(_verbal_path, session_filter=s)[0] for s in _verbal_sessions}
     for sess_label in _verbal_sessions:
         v_agg = _verbal_cache[sess_label]
@@ -1570,8 +1575,9 @@ def summarise(out, label, ctrl_cols, fe_cols):
                       f"p<0.05={(ok<0.05).sum()}, "
                       f"p<0.10={(ok<0.10).sum()} (of {len(ok)})")
 
-if PCA_MODE:
-    _x_df, _pc_cols = session_variants[SESSION_推介]["pca"]
+if PCA_MODE or EFA_MODE:
+    _src_key = "pca" if PCA_MODE else "efa"
+    _x_df, _pc_cols = session_variants[SESSION_推介][_src_key]
 
     # Merge 推介 verbal mods into car_grp for PCA mode (session-specific → use 推介 only)
     if active_verbal_mods and verbal_mod_aggs:
@@ -1636,9 +1642,8 @@ if PCA_MODE:
         for _f in concurrent.futures.as_completed(_futs):
             _f.result()
 else:
-    if PLS_MODE and PCA_MODE:
-        raise ValueError("--pls and --pca are mutually exclusive. "
-                         "PLS operates on raw X features; use --pls without --pca.")
+    if sum([bool(PLS_MODE), bool(PCA_MODE), bool(EFA_MODE)]) > 1:
+        raise ValueError("--pls, --pca, and --efa are mutually exclusive.")
     def _run_group(y_group, y_cols):
         _method = f"PLS (combined, ncomp={PLS_NCOMP})" if PLS_MODE else "OLS"
         print(f"\n=== Running {_method} {y_group} ({len(y_cols)} Y cols) ===")
