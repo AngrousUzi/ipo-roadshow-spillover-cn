@@ -1326,7 +1326,7 @@ def run_regressions_pls_combined(car_grp, y_cols, pls_combined_data, ctrl_cols, 
 
 def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
                          mkt_mod=False, mkt_col=None, all_mods_cfg=None,
-                         group_col="group", group_values=("am", "pm"),
+                         group_col="group", group_values=("am", "pm", "all"),
                          max_pcs=None):
     """PCA cumulative regression: Y ~ pc1, Y ~ pc1+pc2, ... One record per (group, y_col, n_pcs).
     SE clustered at ipo_id level (peer-level data).
@@ -1348,7 +1348,7 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
     merged = car_grp.merge(x_df, on="ipo_id", how="inner").reset_index(drop=True)
 
     for grp in group_values:
-        sub = merged[merged[group_col] == grp].reset_index(drop=True)
+        sub = (merged if grp == "all" else merged[merged[group_col] == grp]).reset_index(drop=True)
 
         fe_parts = []
         for fc in fe_cols:
@@ -1358,6 +1358,8 @@ def run_regressions_pca(car_grp, y_cols, x_df, pc_cols, ctrl_cols, fe_cols,
                 else:
                     dum = pd.get_dummies(sub[fc], prefix=fc, drop_first=True).astype(np.float32)
                     fe_parts.append(dum.values)
+        if grp == "all" and group_col in sub.columns:
+            fe_parts.append((sub[group_col] == "am").astype(np.float32).values.reshape(-1, 1))
         fe_arr = np.column_stack(fe_parts).astype(np.float32) if fe_parts else None
 
         ctrl_arr = None
@@ -1608,7 +1610,7 @@ if PCA_MODE or EFA_MODE:
 
     # Compute quantile groups on the specified PC column when --group is active
     _group_col    = "group"
-    _group_values = ("am", "pm")
+    _group_values = ("am", "pm", "all")
     _car_grp_pca  = car_grp
     if GROUP_COL is not None:
         # Use _x_df (already 1 row per ipo_id) to avoid a many-to-many merge explosion
