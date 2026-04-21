@@ -2,6 +2,8 @@
 """
 Run EFA variants sequentially, regress, and export results to Excel.
 
+Variants = 8 feature configs × 3 rotations = 24 total.
+
 For each variant:
   1. Run EFA script  → overwrites final/pca/efa_scores_combined_tui.csv
   2. Run firstday regression  (--ife --efa --pltfe)
@@ -14,7 +16,7 @@ For each variant:
 
 Usage:
   python final/pca/run_efa_variants.py
-  python final/pca/run_efa_variants.py --variants base oblimin
+  python final/pca/run_efa_variants.py --variants base_varimax fer_3ratios_oblimin
   python final/pca/run_efa_variants.py --top-rivals 1,3,5,10
   python final/pca/run_efa_variants.py --list
 """
@@ -30,11 +32,22 @@ PCA_DIR = ROOT / "final" / "pca"
 REG_DIR = ROOT / "final" / "reg"
 PYTHON  = sys.executable
 
-# Each variant: (name, extra_args_to_efa_script)
-ALL_VARIANTS = [
-    ("base",    []),
+_FEATURE_VARIANTS = [
+    "base", "fer_3ratios", "fer_8emos", "fer_all",
+    "gaze_reduced", "gaze_3ratios", "gaze_8emos", "gaze_all",
+]
+_ROTATIONS = [
+    ("varimax", []),
     ("oblimin", ["--rotation", "oblimin"]),
     ("none",    ["--rotation", "none"]),
+]
+
+# Each variant: (name, extra_args_to_efa_script)
+ALL_VARIANTS = [
+    (f"{fv}_{rot_name}",
+     ["--feature-variant", fv] + rot_args)
+    for fv in _FEATURE_VARIANTS
+    for rot_name, rot_args in _ROTATIONS
 ]
 
 EVERY_BASE_ARGS = [
@@ -100,8 +113,7 @@ def main():
 
     if _args.list:
         for name, extra in ALL_VARIANTS:
-            extra_str = " ".join(extra) if extra else "(default)"
-            print(f"  {name:<12} {extra_str}")
+            print(f"  {name:<28} {' '.join(extra)}")
         return
 
     variants = ALL_VARIANTS
@@ -116,14 +128,14 @@ def main():
     skip = _args.skip_on_error
     top_rivals = [int(x) for x in _args.top_rivals.split(",")]
 
-    for variant, efa_extra_args in variants:
+    for variant, efa_extra in variants:
         print(f"\n{'#' * 70}")
-        print(f"  EFA VARIANT: {variant}  (rotation={efa_extra_args or 'varimax'})")
+        print(f"  EFA VARIANT: {variant}")
         print(f"{'#' * 70}")
 
         # 1. Run EFA
         ok = run(
-            [PYTHON, PCA_DIR / "efa_combined_tui.py"] + efa_extra_args,
+            [PYTHON, PCA_DIR / "efa_combined_tui.py"] + efa_extra,
             f"EFA {variant}", skip,
         )
         if not ok:
@@ -172,7 +184,7 @@ def main():
     print(f"\n{'#' * 70}")
     print("  ALL EFA VARIANTS COMPLETE")
     print(f"{'#' * 70}")
-    for variant, _ in variants:
+    for variant, _extra in variants:
         p = REG_DIR / f"reg_tables_efa_main_{variant}.xlsx"
         mark = "OK" if p.exists() else "MISSING"
         print(f"  [{mark}] {p.name}")

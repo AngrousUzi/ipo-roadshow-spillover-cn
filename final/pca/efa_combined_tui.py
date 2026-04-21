@@ -40,6 +40,10 @@ def _parse_args():
                    choices=["varimax", "oblimin", "promax", "none"],
                    help="Factor rotation method (default: varimax).")
     p.add_argument("--winsor", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--feature-variant", type=str, default="base",
+                   choices=["base", "fer_3ratios", "fer_8emos", "fer_all",
+                            "gaze_reduced", "gaze_3ratios", "gaze_8emos", "gaze_all"],
+                   help="Feature configuration variant (default: base).")
     return p.parse_args()
 
 
@@ -47,6 +51,37 @@ _args = _parse_args()
 ROOT = Path(_args.root) if _args.root else Path(__file__).resolve().parent.parent.parent
 
 SESSION = "推介"
+
+_VISUAL_FULL = [
+    "gaze_at_camera_ratio_10", "gaze_x_mean", "gaze_x_std",
+    "gaze_y_mean", "gaze_y_std", "head_frontal_ratio_10",
+    "head_pitch_mean", "head_pitch_std", "head_yaw_mean", "head_yaw_std",
+]
+_VISUAL_REDUCED = [
+    "gaze_at_camera_ratio_10", "gaze_x_std", "gaze_y_std",
+    "head_pitch_mean", "head_pitch_std", "head_yaw_std",
+]
+_FER_3RATIOS = ["positive_ratio", "negative_ratio", "neutral_ratio"]
+_FER_8EMOS   = ["emo_angry", "emo_contempt", "emo_disgust", "emo_fear",
+                "emo_happy", "emo_neutral", "emo_sad", "emo_surprise"]
+_FER_BASE    = ["positive_ratio", "negative_ratio", "neutral_ratio",
+                "emo_happy", "emo_neutral", "emo_sad"]
+_FER_ALL     = _FER_3RATIOS + _FER_8EMOS
+
+_FEATURE_VARIANTS = {
+    "base":         (_VISUAL_FULL,    _FER_BASE),
+    "fer_3ratios":  (_VISUAL_FULL,    _FER_3RATIOS),
+    "fer_8emos":    (_VISUAL_FULL,    _FER_8EMOS),
+    "fer_all":      (_VISUAL_FULL,    _FER_ALL),
+    "gaze_reduced": (_VISUAL_REDUCED, _FER_BASE),
+    "gaze_3ratios": (_VISUAL_REDUCED, _FER_3RATIOS),
+    "gaze_8emos":   (_VISUAL_REDUCED, _FER_8EMOS),
+    "gaze_all":     (_VISUAL_REDUCED, _FER_ALL),
+}
+
+_vis_cols, _fer_cols = _FEATURE_VARIANTS[_args.feature_variant]
+print(f"Feature variant: {_args.feature_variant}  "
+      f"({len(_vis_cols)} visual + {len(_fer_cols)} fer cols)")
 
 GROUPS = {
     "verbal": {
@@ -66,18 +101,11 @@ GROUPS = {
     },
     "visual": {
         "source": "analyze/output/visual_gaze.csv",
-        "cols": [
-            "gaze_at_camera_ratio_10", "gaze_x_mean", "gaze_x_std",
-            "gaze_y_mean", "gaze_y_std", "head_frontal_ratio_10",
-            "head_pitch_mean", "head_pitch_std", "head_yaw_mean", "head_yaw_std",
-        ],
+        "cols": _vis_cols,
     },
     "visual_fer": {
         "source": "analyze/output/visual_fer.csv",
-        "cols": [
-            "positive_ratio", "negative_ratio", "neutral_ratio",
-            "emo_happy", "emo_neutral", "emo_sad",
-        ],
+        "cols": _fer_cols,
     },
 }
 
